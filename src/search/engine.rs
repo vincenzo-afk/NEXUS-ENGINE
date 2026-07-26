@@ -32,12 +32,15 @@ pub struct SearchResult {
 
 /// Executes `query` against `index`, returning the top `limit` results
 /// starting at `offset` (for pagination), ordered by descending score.
+/// `clicks` supplies the click-history ranking signal; pass `None` if no
+/// click log is being tracked.
 pub fn search(
     index: &Index,
     query: &QueryNode,
     config: &crate::config::RankingConfig,
     offset: usize,
     limit: usize,
+    clicks: Option<&crate::clicks::ClickLog>,
 ) -> Vec<SearchResult> {
     let matches = evaluate(query, index);
     let now_unix = chrono::Utc::now().timestamp();
@@ -53,9 +56,17 @@ pub fn search(
                         .keys()
                         .all(|term| metadata.file_name.to_lowercase().contains(term.as_str()));
             }
+            if !match_info.url_match {
+                let path_lower = metadata.path.to_string_lossy().to_lowercase();
+                match_info.url_match = !match_info.term_frequencies.is_empty()
+                    && match_info
+                        .term_frequencies
+                        .keys()
+                        .any(|term| path_lower.contains(term.as_str()));
+            }
 
             let explanation =
-                ranking::score_document(index, doc_id, &match_info, config, now_unix)?;
+                ranking::score_document(index, doc_id, &match_info, config, now_unix, clicks)?;
 
             Some(SearchResult {
                 doc_id,
@@ -118,6 +129,25 @@ fn evaluate(node: &QueryNode, index: &Index) -> HashMap<DocId, MatchInfo> {
                 }
             })
         }
+        QueryNode::FilterSite(domain) => filter_web_docs(index, |meta| {
+            meta.domain == *domain || meta.domain.ends_with(&format!(".{domain}"))
+        }),
+        QueryNode::FilterDate(op, threshold_unix) => filter_docs(index, |meta| {
+            match op {
+                CompareOp::LessThan => meta.modified_unix < *threshold_unix,
+                CompareOp::GreaterThan => meta.modified_unix > *threshold_unix,
+                CompareOp::Equal => meta.modified_unix == *threshold_unix,
+            }
+        }),
+        QueryNode::FilterLang(lang) => {
+            filter_web_docs(index, |meta| meta.lang.as_deref() == Some(lang.as_str()))
+        }
+        QueryNode::FilterAuthor(author) => filter_web_docs(index, |meta| {
+            meta.author
+                .as_deref()
+                .map(|a| a.to_lowercase().contains(author.as_str()))
+                .unwrap_or(false)
+        }),
     }
 }
 
@@ -135,6 +165,21 @@ fn filter_docs(
 ) -> HashMap<DocId, MatchInfo> {
     index
         .store
+        .iter()
+        .filter(|(_, meta)| predicate(meta))
+        .map(|(id, _)| (id, MatchInfo::default()))
+        .collect()
+}
+
+/// Like [`filter_docs`], but the predicate examines a web page's crawl
+/// metadata rather than its generic [`crate::document::DocumentMetadata`].
+/// Documents with no web metadata (local files) never match.
+fn filter_web_docs(
+    index: &Index,
+    predicate: impl Fn(&crate::webdoc::WebPageMeta) -> bool,
+) -> HashMap<DocId, MatchInfo> {
+    index
+        .web
         .iter()
         .filter(|(_, meta)| predicate(meta))
         .map(|(id, _)| (id, MatchInfo::default()))
@@ -335,6 +380,7 @@ fn merge_match_info(existing: &mut MatchInfo, other: MatchInfo) {
     }
     existing.exact_phrase_match = existing.exact_phrase_match || other.exact_phrase_match;
     existing.filename_match = existing.filename_match || other.filename_match;
+    existing.url_match = existing.url_match || other.url_match;
 }
 
 /// Matches a simple glob pattern (`*` = any run of characters, `?` = any

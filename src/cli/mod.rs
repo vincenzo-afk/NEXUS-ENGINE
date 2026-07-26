@@ -95,4 +95,48 @@ pub enum Commands {
         #[arg(short, long, default_value_t = 8)]
         limit: usize,
     },
+
+    /// Crawl one or more web pages (and everything linked from them,
+    /// within the configured budget) and index their content.
+    Crawl {
+        /// Seed URLs to start crawling from.
+        urls: Vec<String>,
+        /// Maximum number of pages to fetch in this run (overrides config).
+        #[arg(long)]
+        max_pages: Option<usize>,
+        /// Maximum link-following depth from a seed (overrides config).
+        #[arg(long)]
+        max_depth: Option<u32>,
+        /// Restrict crawling to these registrable domains (and subdomains).
+        /// May be given multiple times. Overrides config if provided.
+        #[arg(long = "domain")]
+        allowed_domains: Vec<String>,
+        /// Resume a previously interrupted crawl from the saved queue
+        /// instead of starting fresh.
+        #[arg(long)]
+        resume: bool,
+        /// Ignore robots.txt (not recommended; only for infrastructure you control).
+        #[arg(long)]
+        ignore_robots: bool,
+    },
+
+    /// Recompute PageRank scores over the crawled link graph.
+    Pagerank,
+
+    /// Record that a search result was clicked, feeding the click-history
+    /// ranking signal. Intended to be called by a browser extension or
+    /// UI; exposed here so the signal is exercised end-to-end.
+    Click {
+        /// The query that was run.
+        query: String,
+        /// The 1-based rank of the result that was clicked, as shown by `nexus search`.
+        rank: usize,
+    },
+
+    /// Start the HTTP search API server (`GET /search?q=...`).
+    Serve {
+        /// Address to bind to.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+    },
 }

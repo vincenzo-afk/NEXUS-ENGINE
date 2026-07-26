@@ -12,6 +12,14 @@
 //! * `name:main`              -> `FilterName(main)`
 //! * `size>100KB`             -> `FilterSize(GreaterThan, 102400)`
 //! * `modified<7d`            -> `FilterModified(NewerThan, 7 days)`
+//! * `site:github.com`        -> `FilterSite(github.com)`
+//! * `filetype:pdf`           -> `FilterExt(pdf)` (alias for `ext:`)
+//! * `before:2024`            -> `FilterDate(LessThan, 2024-01-01T00:00:00Z)`
+//! * `after:2022-06-01`       -> `FilterDate(GreaterThan, 2022-06-01T00:00:00Z)`
+//! * `lang:en`                -> `FilterLang(en)`
+//! * `author:jane`            -> `FilterAuthor(jane)`
+//! * `intitle:rust`           -> `FilterName(rust)` (alias for `name:`)
+//! * `inurl:async`            -> `FilterPath(async)` (alias for `path:`)
 
 /// A comparison operator for numeric filters (`size`, `modified`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +71,19 @@ pub enum QueryNode {
     /// (newer), `GreaterThan` means "modified more than N seconds ago"
     /// (older).
     FilterModified(CompareOp, i64),
+    /// `site:github.com` - restrict to web pages on a given (registrable)
+    /// domain. No-op filter (matches nothing) for local files, since they
+    /// have no domain.
+    FilterSite(String),
+    /// `before:2024-01-01` / `after:2022` - restrict by an absolute
+    /// modified/fetched date rather than a relative age. `LessThan` means
+    /// "before this date", `GreaterThan` means "after this date".
+    FilterDate(CompareOp, i64),
+    /// `lang:en` - restrict to web pages declaring this `<html lang>`.
+    FilterLang(String),
+    /// `author:jane` - restrict to web pages whose `<meta name="author">`
+    /// contains this substring.
+    FilterAuthor(String),
 }
 
 impl QueryNode {
@@ -85,7 +106,11 @@ impl QueryNode {
             | QueryNode::FilterPath(_)
             | QueryNode::FilterName(_)
             | QueryNode::FilterSize(_, _)
-            | QueryNode::FilterModified(_, _) => false,
+            | QueryNode::FilterModified(_, _)
+            | QueryNode::FilterSite(_)
+            | QueryNode::FilterDate(_, _)
+            | QueryNode::FilterLang(_)
+            | QueryNode::FilterAuthor(_) => false,
         }
     }
 }

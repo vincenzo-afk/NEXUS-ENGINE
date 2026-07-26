@@ -135,11 +135,40 @@ fn word_to_node(word: &str) -> QueryNode {
 
 fn build_filter(key: &str, value: &str) -> Result<QueryNode> {
     match key.to_lowercase().as_str() {
-        "ext" => Ok(QueryNode::FilterExt(value.to_lowercase())),
-        "path" => Ok(QueryNode::FilterPath(text::normalize(value))),
-        "name" => Ok(QueryNode::FilterName(text::normalize(value))),
+        "ext" | "filetype" => Ok(QueryNode::FilterExt(value.trim_start_matches('.').to_lowercase())),
+        "path" | "inurl" => Ok(QueryNode::FilterPath(text::normalize(value))),
+        "name" | "intitle" => Ok(QueryNode::FilterName(text::normalize(value))),
+        "site" => Ok(QueryNode::FilterSite(
+            value.to_lowercase().trim_start_matches("www.").to_string(),
+        )),
+        "lang" => Ok(QueryNode::FilterLang(value.to_lowercase())),
+        "author" => Ok(QueryNode::FilterAuthor(text::normalize(value))),
+        "before" => Ok(QueryNode::FilterDate(CompareOp::LessThan, parse_date(value)?)),
+        "after" => Ok(QueryNode::FilterDate(CompareOp::GreaterThan, parse_date(value)?)),
         other => Err(NexusError::QueryParse(format!("unknown filter: {}", other))),
     }
+}
+
+/// Parses an absolute date string (`2024`, `2024-01`, or `2024-01-15`) into
+/// a UNIX timestamp at midnight UTC, for `before:`/`after:` filters.
+fn parse_date(value: &str) -> Result<i64> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+
+    let value = value.trim();
+    let date = if let Ok(d) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        d
+    } else if let Ok(d) = NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d") {
+        d
+    } else if let Ok(d) = NaiveDate::parse_from_str(&format!("{value}-01-01"), "%Y-%m-%d") {
+        d
+    } else {
+        return Err(NexusError::QueryParse(format!("invalid date: {}", value)));
+    };
+
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| NexusError::QueryParse(format!("invalid date: {}", value)))?;
+    Ok(Utc.from_utc_datetime(&datetime).timestamp())
 }
 
 fn build_compare_filter(key: &str, op: char, value: &str) -> Result<QueryNode> {
@@ -314,5 +343,52 @@ mod tests {
             parse("wor?d").unwrap(),
             QueryNode::Wildcard("wor?d".into())
         );
+    }
+
+    #[test]
+    fn parses_site_and_filetype_operators() {
+        assert_eq!(
+            parse("site:github.com").unwrap(),
+            QueryNode::FilterSite("github.com".into())
+        );
+        assert_eq!(
+            parse("filetype:pdf").unwrap(),
+            QueryNode::FilterExt("pdf".into())
+        );
+    }
+
+    #[test]
+    fn parses_intitle_and_inurl_as_aliases() {
+        assert_eq!(
+            parse("intitle:rust").unwrap(),
+            QueryNode::FilterName("rust".into())
+        );
+        assert_eq!(
+            parse("inurl:async").unwrap(),
+            QueryNode::FilterPath("async".into())
+        );
+    }
+
+    #[test]
+    fn parses_lang_and_author() {
+        assert_eq!(parse("lang:en").unwrap(), QueryNode::FilterLang("en".into()));
+        assert_eq!(
+            parse("author:jane").unwrap(),
+            QueryNode::FilterAuthor("jane".into())
+        );
+    }
+
+    #[test]
+    fn parses_before_and_after_dates() {
+        let node = parse("before:2024-01-01").unwrap();
+        match node {
+            QueryNode::FilterDate(CompareOp::LessThan, ts) => {
+                assert_eq!(ts, 1704067200); // 2024-01-01T00:00:00Z
+            }
+            other => panic!("unexpected node: {:?}", other),
+        }
+
+        let node = parse("after:2022").unwrap();
+        assert!(matches!(node, QueryNode::FilterDate(CompareOp::GreaterThan, _)));
     }
 }

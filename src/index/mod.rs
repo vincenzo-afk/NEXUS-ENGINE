@@ -7,16 +7,23 @@ pub mod posting;
 pub mod store;
 pub mod vocabulary;
 
+use crate::dedup::DuplicateIndex;
 use crate::document::{Document, DocId};
 use crate::index::inverted::InvertedIndex;
 use crate::index::store::DocumentStore;
 use crate::index::vocabulary::{TermId, Vocabulary};
+use crate::webdoc::WebMetaStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// The current on-disk format version. Bumped whenever the serialized
 /// layout of [`Index`] changes in an incompatible way.
-pub const INDEX_FORMAT_VERSION: u32 = 1;
+///
+/// v2 added `web`, the per-page crawl/link-graph metadata store, and
+/// `duplicates`, the near-duplicate detection index, to support web
+/// crawling. Index files written by v1 (filesystem-only) builds are not
+/// forward compatible; run `nexus rebuild` after upgrading.
+pub const INDEX_FORMAT_VERSION: u32 = 2;
 
 /// The complete, persistable search index.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -27,6 +34,15 @@ pub struct Index {
     pub inverted: InvertedIndex,
     /// Document ID -> metadata mapping.
     pub store: DocumentStore,
+    /// Crawl and link-graph metadata for documents sourced from the web
+    /// (empty/unused for purely filesystem-indexed documents).
+    #[serde(default)]
+    pub web: WebMetaStore,
+    /// Near-duplicate / exact-duplicate detection index, consulted while
+    /// crawling so mirrors and boilerplate-only-differs pages don't get
+    /// indexed twice.
+    #[serde(default)]
+    pub duplicates: DuplicateIndex,
 }
 
 impl Index {
@@ -36,6 +52,8 @@ impl Index {
             vocabulary: Vocabulary::new(),
             inverted: InvertedIndex::new(),
             store: DocumentStore::new(),
+            web: WebMetaStore::new(),
+            duplicates: DuplicateIndex::new(),
         }
     }
 
@@ -71,6 +89,8 @@ impl Index {
     pub fn remove_document(&mut self, doc_id: DocId) -> bool {
         if let Some(meta) = self.store.remove(doc_id) {
             self.inverted.remove_document(doc_id, meta.token_count);
+            self.web.remove(doc_id);
+            self.duplicates.remove(doc_id);
             true
         } else {
             false

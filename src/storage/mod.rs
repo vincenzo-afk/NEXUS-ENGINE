@@ -7,6 +7,8 @@
 //! truncation or corruption before attempting to deserialize, producing a
 //! clear error instead of a confusing panic deep inside bincode.
 
+pub mod content_cache;
+
 use crate::error::{NexusError, Result};
 use crate::index::{Index, INDEX_FORMAT_VERSION};
 use std::io::{Read, Write};

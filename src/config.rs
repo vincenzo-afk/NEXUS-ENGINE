@@ -23,6 +23,28 @@ pub struct RankingConfig {
     pub exact_match_boost: f32,
     /// Multiplicative boost applied to more recently modified documents.
     pub recency_boost: f32,
+    /// How strongly a page's PageRank score influences its final rank.
+    /// `final *= 1.0 + pagerank_weight * (pagerank * document_count)`; the
+    /// `document_count` factor rescales PageRank (which sums to ~1.0
+    /// across the whole graph) back up to an "average share" of 1.0 so
+    /// the weight is meaningful regardless of how many pages are indexed.
+    pub pagerank_weight: f32,
+    /// Multiplicative boost applied when the query matches a web page's
+    /// `<title>`.
+    pub title_match_boost: f32,
+    /// Multiplicative boost applied when the query matches a web page's URL.
+    pub url_match_boost: f32,
+    /// Weight applied to click history: `1.0 + click_weight * ln(1 + clicks)`.
+    pub click_weight: f32,
+    /// Multiplicative boost applied to pages on an explicitly trusted domain.
+    pub trusted_domain_boost: f32,
+    /// Multiplicative penalty applied to pages on an explicitly
+    /// low-quality/spam domain (should be < 1.0).
+    pub spam_domain_penalty: f32,
+    /// Domains (registrable, no `www.`) that receive [`trusted_domain_boost`](Self::trusted_domain_boost).
+    pub trusted_domains: HashSet<String>,
+    /// Domains that receive [`spam_domain_penalty`](Self::spam_domain_penalty).
+    pub spam_domains: HashSet<String>,
 }
 
 impl Default for RankingConfig {
@@ -33,6 +55,68 @@ impl Default for RankingConfig {
             filename_boost: 2.0,
             exact_match_boost: 1.5,
             recency_boost: 1.1,
+            pagerank_weight: 0.5,
+            title_match_boost: 1.6,
+            url_match_boost: 1.2,
+            click_weight: 0.15,
+            trusted_domain_boost: 1.15,
+            spam_domain_penalty: 0.5,
+            trusted_domains: [
+                "wikipedia.org",
+                "github.com",
+                "docs.rs",
+                "developer.mozilla.org",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            spam_domains: HashSet::new(),
+        }
+    }
+}
+
+/// Web-crawler tunables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebCrawlConfig {
+    /// `User-Agent` header sent with every crawl request.
+    pub user_agent: String,
+    /// Maximum number of pages fetched in a single `nexus crawl` run.
+    pub max_pages: usize,
+    /// Maximum link-following depth from a seed URL.
+    pub max_depth: u32,
+    /// Minimum delay between requests to the same domain, in milliseconds,
+    /// used when `robots.txt` declares no `Crawl-delay` of its own.
+    pub default_delay_millis: u64,
+    /// Per-request timeout, in seconds.
+    pub timeout_seconds: u64,
+    /// Maximum retry attempts for transient failures.
+    pub max_retries: u32,
+    /// Whether to respect `robots.txt`. Disabling this is strongly
+    /// discouraged and intended only for crawling infrastructure you
+    /// control yourself.
+    pub respect_robots: bool,
+    /// If non-empty, only these registrable domains (and their
+    /// subdomains) are ever fetched, regardless of what links are
+    /// discovered. Leave empty to allow the crawl to follow links
+    /// anywhere (bounded by `max_pages` and `max_depth`).
+    pub allowed_domains: Vec<String>,
+    /// Maximum response body size, in bytes, that will be downloaded.
+    pub max_page_size_bytes: u64,
+}
+
+impl Default for WebCrawlConfig {
+    fn default() -> Self {
+        WebCrawlConfig {
+            user_agent: "NexusBot/1.0 (+https://github.com/vincenzo-afk/nexus; search-crawler)"
+                .to_string(),
+            max_pages: 500,
+            max_depth: 5,
+            default_delay_millis: 1000,
+            timeout_seconds: 20,
+            max_retries: 3,
+            respect_robots: true,
+            allowed_domains: Vec::new(),
+            max_page_size_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -53,6 +137,9 @@ pub struct Config {
     pub max_file_size_bytes: u64,
     /// Ranking tunables.
     pub ranking: RankingConfig,
+    /// Web crawler tunables.
+    #[serde(default)]
+    pub web_crawl: WebCrawlConfig,
     /// Size, in entries, of the in-memory search-result cache.
     pub cache_size: usize,
     /// Number of worker threads used for crawling/indexing. `0` means "use
@@ -60,6 +147,18 @@ pub struct Config {
     pub thread_count: usize,
     /// Path on disk where the binary index is persisted.
     pub index_path: PathBuf,
+    /// Directory on disk where extracted plain-text content of crawled
+    /// web pages is cached, so snippets can be generated without
+    /// re-fetching the page. Local filesystem documents don't need this
+    /// (their content is re-read from disk on demand).
+    #[serde(default = "default_content_cache_dir")]
+    pub content_cache_dir: PathBuf,
+    /// Path on disk where the click-history log is persisted.
+    #[serde(default = "default_clicks_path")]
+    pub clicks_path: PathBuf,
+    /// Path on disk where the resumable crawl queue is persisted.
+    #[serde(default = "default_queue_path")]
+    pub crawl_queue_path: PathBuf,
 }
 
 impl Default for Config {
@@ -88,9 +187,13 @@ impl Default for Config {
             ignore_hidden: true,
             max_file_size_bytes: 25 * 1024 * 1024, // 25 MiB
             ranking: RankingConfig::default(),
+            web_crawl: WebCrawlConfig::default(),
             cache_size: 256,
             thread_count: 0,
             index_path: default_index_path(),
+            content_cache_dir: default_content_cache_dir(),
+            clicks_path: default_clicks_path(),
+            crawl_queue_path: default_queue_path(),
         }
     }
 }
@@ -101,6 +204,30 @@ fn default_index_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("nexus")
         .join("index.nxi")
+}
+
+/// Returns the default on-disk directory for cached web page content.
+fn default_content_cache_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nexus")
+        .join("web_content_cache")
+}
+
+/// Returns the default on-disk location for the click-history log.
+fn default_clicks_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nexus")
+        .join("clicks.nxc")
+}
+
+/// Returns the default on-disk location for the resumable crawl queue.
+fn default_queue_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("nexus")
+        .join("crawl_queue.nxq")
 }
 
 /// Returns the default on-disk location of the configuration file.

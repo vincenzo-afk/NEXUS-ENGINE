@@ -2,9 +2,15 @@
 //! terms highlighted, generated on demand at search time.
 //!
 //! Nexus does not persist full document text in the index (only postings
-//! and metadata), so snippet generation re-reads the file's content for
-//! the handful of top-ranked results being displayed. This keeps the
-//! index small while still providing rich, contextual previews.
+//! and metadata), so snippet generation re-reads the content for the
+//! handful of top-ranked results being displayed: from disk for local
+//! files, or from the [`crate::storage::content_cache::ContentCache`] for
+//! crawled web pages. This keeps the index itself small while still
+//! providing rich, contextual previews. Rather than simply centering on
+//! the first occurrence of a query term, the generator scans every
+//! candidate window and picks the one containing the most distinct query
+//! terms, which in practice lands on the sentence that best represents why
+//! the document matched.
 
 use crate::error::{NexusError, Result};
 use crate::text;
@@ -25,25 +31,31 @@ pub struct Snippet {
     pub total_matches: usize,
 }
 
-/// Generates a highlighted snippet for `path`, centered on the first
-/// occurrence of any term in `terms`.
+/// Generates a highlighted snippet for the file at `path`.
 pub fn generate(path: &Path, terms: &HashSet<String>) -> Result<Snippet> {
     let raw = std::fs::read(path).map_err(|e| NexusError::io(path, e))?;
     let content = String::from_utf8_lossy(&raw).into_owned();
-    let normalized = text::normalize(&content);
+    Ok(generate_from_content(&content, terms))
+}
+
+/// Generates a highlighted snippet directly from already-loaded `content`
+/// (used for web pages, whose text comes from the content cache rather
+/// than a re-readable file path).
+pub fn generate_from_content(content: &str, terms: &HashSet<String>) -> Snippet {
+    let normalized = text::normalize(content);
     let tokens = text::tokenize(&normalized);
 
     let matches: Vec<&text::Token> = tokens.iter().filter(|t| terms.contains(&t.text)).collect();
 
     if matches.is_empty() {
         let preview: String = normalized.chars().take(CONTEXT_CHARS * 2).collect();
-        return Ok(Snippet {
+        return Snippet {
             text: preview,
             total_matches: 0,
-        });
+        };
     }
 
-    let anchor = matches[0];
+    let anchor = best_anchor(&matches);
     let start = (anchor.start_offset as usize).saturating_sub(CONTEXT_CHARS);
     let end = (anchor.end_offset as usize + CONTEXT_CHARS).min(normalized.len());
 
@@ -54,10 +66,40 @@ pub fn generate(path: &Path, terms: &HashSet<String>) -> Result<Snippet> {
     let window = &normalized[start..end];
     let highlighted = highlight_window(window, start, &matches, terms);
 
-    Ok(Snippet {
+    Snippet {
         text: highlighted,
         total_matches: matches.len(),
-    })
+    }
+}
+
+/// Picks the match token whose `CONTEXT_CHARS`-radius window contains the
+/// greatest number of *distinct* query terms (ties broken by earliest
+/// position), so the returned snippet reads like the sentence most
+/// representative of the match rather than just wherever the first term
+/// happened to appear.
+fn best_anchor<'a>(matches: &[&'a text::Token]) -> &'a text::Token {
+    let mut best_idx = 0;
+    let mut best_score = 0usize;
+
+    for (i, candidate) in matches.iter().enumerate() {
+        let window_start = candidate.start_offset.saturating_sub(CONTEXT_CHARS as u32);
+        let window_end = candidate.end_offset + CONTEXT_CHARS as u32;
+
+        let mut distinct: HashSet<&str> = HashSet::new();
+        for other in matches {
+            if other.start_offset >= window_start && other.end_offset <= window_end {
+                distinct.insert(other.text.as_str());
+            }
+        }
+        let score = distinct.len();
+
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    matches[best_idx]
 }
 
 /// Moves `offset` to the nearest valid UTF-8 char boundary, searching
@@ -120,4 +162,45 @@ fn highlight_window(
     suffix.push_str("...");
 
     format!("{}{}{}", prefix, result, suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_window_with_most_distinct_terms() {
+        let sparse_prefix = "In the beginning there was only rust, alone and quiet, \
+            far from anything else nearby at all in this part of the document. ";
+        let filler = "This filler text does not contain any of the target keywords at all, \
+            it is only here to add distance between the two interesting spots. ";
+        let dense_cluster = "Now consider rust and parser together: rust parser rust parser \
+            combine here in a rich flurry of matches for testing purposes.";
+        let content = format!("{sparse_prefix}{filler}{dense_cluster}");
+
+        let terms: HashSet<String> = ["rust", "parser"].iter().map(|s| s.to_string()).collect();
+        let snippet = generate_from_content(&content, &terms);
+        // The dense cluster should be chosen over the sparse opening
+        // sentence, which is far enough away (> CONTEXT_CHARS) that a
+        // window anchored there cannot see the dense cluster at all.
+        assert!(snippet.text.contains("combine"), "got: {}", snippet.text);
+        assert!(!snippet.text.contains("beginning"), "got: {}", snippet.text);
+    }
+
+    #[test]
+    fn highlights_matched_terms() {
+        let content = "The rust programming language is fast and safe.";
+        let terms: HashSet<String> = ["rust"].iter().map(|s| s.to_string()).collect();
+        let snippet = generate_from_content(content, &terms);
+        assert!(snippet.text.contains("**rust**"));
+        assert_eq!(snippet.total_matches, 1);
+    }
+
+    #[test]
+    fn empty_match_falls_back_to_preview() {
+        let content = "Nothing relevant here at all.";
+        let terms: HashSet<String> = ["rust"].iter().map(|s| s.to_string()).collect();
+        let snippet = generate_from_content(content, &terms);
+        assert_eq!(snippet.total_matches, 0);
+    }
 }

@@ -63,6 +63,46 @@ pub enum NexusError {
     /// Catch-all for validation failures with a human-readable message.
     #[error("{0}")]
     Other(String),
+
+    /// A network/HTTP request failed (connection, TLS, timeout, etc).
+    #[error("HTTP error fetching '{url}': {message}")]
+    Http {
+        /// The URL being fetched when the error occurred.
+        url: String,
+        /// A human-readable description of the failure.
+        message: String,
+    },
+
+    /// A URL string could not be parsed.
+    #[error("invalid URL '{0}': {1}")]
+    InvalidUrl(String, String),
+
+    /// robots.txt disallows crawling the given URL.
+    #[error("robots.txt disallows fetching '{0}'")]
+    RobotsDisallowed(String),
+
+    /// The crawler exceeded its configured page, depth, or time budget.
+    #[error("crawl budget exhausted: {0}")]
+    CrawlBudgetExhausted(String),
+
+    /// A document could not be parsed as its declared/inferred format.
+    #[error("failed to parse {format} content: {message}")]
+    ParseFormat {
+        /// The format that failed to parse (html, pdf, markdown, ...).
+        format: String,
+        /// A human-readable description of the failure.
+        message: String,
+    },
+}
+
+impl NexusError {
+    /// Builds an [`NexusError::Http`] variant.
+    pub fn http(url: impl Into<String>, message: impl Into<String>) -> Self {
+        NexusError::Http {
+            url: url.into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl NexusError {

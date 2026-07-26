@@ -11,12 +11,17 @@
 //! below: it parses CLI arguments, configures logging, and dispatches to
 //! the appropriate command handler in [`cli::commands`].
 
+mod api;
 mod autocomplete;
 mod cli;
+mod clicks;
 mod config;
+mod dedup;
 mod document;
 mod error;
+mod formats;
 mod fs;
+mod html;
 mod index;
 mod query;
 mod ranking;
@@ -26,6 +31,8 @@ mod stats;
 mod storage;
 mod text;
 mod watcher;
+mod web;
+mod webdoc;
 
 use clap::Parser;
 use cli::Cli;

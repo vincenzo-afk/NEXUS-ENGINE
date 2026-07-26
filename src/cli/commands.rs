@@ -6,7 +6,8 @@
 
 use crate::autocomplete::{Autocomplete, SearchHistory};
 use crate::cli::Commands;
-use crate::config::Config;
+use crate::clicks::ClickLog;
+use crate::config::{Config, WebCrawlConfig};
 use crate::document::Document;
 use crate::error::Result;
 use crate::fs::{crawl_folder, CrawlOptions};
@@ -16,6 +17,8 @@ use crate::search::snippet;
 use crate::spellcheck;
 use crate::stats;
 use crate::storage;
+use crate::storage::content_cache::ContentCache;
+use crate::web::{WebCrawlOptions, WebCrawler};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -63,6 +66,17 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
         Commands::RemoveFolder { folder } => cmd_remove_folder(&mut config, config_path, folder),
         Commands::Clear => cmd_clear(&config),
         Commands::Suggest { prefix, limit } => cmd_suggest(&config, &prefix, limit),
+        Commands::Crawl {
+            urls,
+            max_pages,
+            max_depth,
+            allowed_domains,
+            resume,
+            ignore_robots,
+        } => cmd_crawl(&config, urls, max_pages, max_depth, allowed_domains, resume, ignore_robots),
+        Commands::Pagerank => cmd_pagerank(&config),
+        Commands::Click { query, rank } => cmd_click(&config, &query, rank),
+        Commands::Serve { bind } => cmd_serve(&config, &bind),
     }
 }
 
@@ -137,13 +151,16 @@ fn cmd_search(
 ) -> Result<()> {
     let index = load_index(config)?;
     if index.document_count() == 0 {
-        println!("index is empty; run `nexus index <folder>` first");
+        println!("index is empty; run `nexus index <folder>` or `nexus crawl <url>` first");
         return Ok(());
     }
 
+    let clicks = ClickLog::load(&config.clicks_path).unwrap_or_default();
+    let content_cache = ContentCache::new(config.content_cache_dir.clone());
+
     let started = Instant::now();
     let ast = query::parse(query_str)?;
-    let results = crate::search::search(&index, &ast, &config.ranking, offset, limit);
+    let results = crate::search::search(&index, &ast, &config.ranking, offset, limit, Some(&clicks));
     let elapsed = started.elapsed();
 
     if results.is_empty() {
@@ -159,22 +176,33 @@ fn cmd_search(
     );
 
     for (rank, result) in results.iter().enumerate() {
+        let web_meta = index.web.get(result.doc_id);
+        let label = web_meta.map(|m| m.title.as_str()).filter(|t| !t.is_empty());
         println!(
             "{}. {}  [score {:.3}]",
             offset + rank + 1,
-            result.path.display(),
+            label.unwrap_or_else(|| result.path.to_str().unwrap_or_default()),
             result.score
         );
+        if web_meta.is_some() {
+            println!("   {}", result.path.display());
+        }
         println!(
-            "   {} | {} matches",
+            "   {} | {} matches{}",
             human_bytes(result.size_bytes),
-            result.match_count
+            result.match_count,
+            web_meta.map(|m| format!(" | {}", m.domain)).unwrap_or_default()
         );
 
         if !no_snippets {
-            let terms: HashSet<String> = collect_query_terms(&ast);
+            let terms: HashSet<String> = query::collect_terms(&ast);
             if !terms.is_empty() {
-                if let Ok(snippet) = snippet::generate(&result.path, &terms) {
+                let content = match web_meta {
+                    Some(_) => content_cache.load(result.doc_id).ok(),
+                    None => std::fs::read_to_string(&result.path).ok(),
+                };
+                if let Some(content) = content {
+                    let snippet = snippet::generate_from_content(&content, &terms);
                     println!("   {}", snippet.text.replace('\n', " "));
                 }
             }
@@ -182,11 +210,15 @@ fn cmd_search(
 
         if explain {
             println!(
-                "   explain: bm25={:.3} filename_boost={:.2} exact_boost={:.2} recency_boost={:.2}",
+                "   explain: bm25={:.3} filename/title={:.2} exact={:.2} recency={:.2} pagerank={:.2} url={:.2} domain={:.2} clicks={:.2}",
                 result.explanation.bm25_score,
                 result.explanation.filename_boost,
                 result.explanation.exact_match_boost,
-                result.explanation.recency_boost
+                result.explanation.recency_boost,
+                result.explanation.pagerank_boost,
+                result.explanation.url_match_boost,
+                result.explanation.domain_quality_boost,
+                result.explanation.click_boost,
             );
         }
         println!();
@@ -199,36 +231,6 @@ fn cmd_search(
     }
 
     Ok(())
-}
-
-/// Collects every literal term referenced anywhere in the query AST, for
-/// snippet highlighting purposes.
-fn collect_query_terms(node: &query::QueryNode) -> HashSet<String> {
-    use query::QueryNode::*;
-    let mut terms = HashSet::new();
-    match node {
-        Term(t) => {
-            terms.insert(t.clone());
-        }
-        Phrase(ts) => terms.extend(ts.iter().cloned()),
-        Prefix(p) => {
-            terms.insert(p.clone());
-        }
-        Wildcard(w) => {
-            terms.insert(w.clone());
-        }
-        Fuzzy { term, .. } => {
-            terms.insert(term.clone());
-        }
-        And(children) | Or(children) => {
-            for c in children {
-                terms.extend(collect_query_terms(c));
-            }
-        }
-        Not(_) => {}
-        FilterExt(_) | FilterPath(_) | FilterName(_) | FilterSize(_, _) | FilterModified(_, _) => {}
-    }
-    terms
 }
 
 fn offer_spelling_suggestions(index: &Index, query_str: &str) {
@@ -425,4 +427,155 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit_idx])
     }
+}
+
+fn cmd_crawl(
+    config: &Config,
+    urls: Vec<String>,
+    max_pages: Option<usize>,
+    max_depth: Option<u32>,
+    allowed_domains: Vec<String>,
+    resume: bool,
+    ignore_robots: bool,
+) -> Result<()> {
+    if urls.is_empty() && !resume {
+        println!("no seed URLs given; pass one or more URLs, or --resume to continue a saved crawl");
+        return Ok(());
+    }
+
+    let mut web_config: WebCrawlConfig = config.web_crawl.clone();
+    if let Some(n) = max_pages {
+        web_config.max_pages = n;
+    }
+    if let Some(d) = max_depth {
+        web_config.max_depth = d;
+    }
+    if !allowed_domains.is_empty() {
+        web_config.allowed_domains = allowed_domains;
+    }
+    if ignore_robots {
+        web_config.respect_robots = false;
+        println!("warning: robots.txt checks disabled for this crawl");
+    }
+
+    let mut index = load_index(config)?;
+    let content_cache = ContentCache::new(config.content_cache_dir.clone());
+    let mut crawler = WebCrawler::new(web_config)?;
+
+    println!(
+        "crawling {} seed(s) (max {} pages, depth {})...",
+        urls.len().max(1),
+        crawler_max_pages(config, max_pages),
+        crawler_max_depth(config, max_depth)
+    );
+
+    let started = Instant::now();
+    let options = WebCrawlOptions {
+        seeds: urls,
+        queue_path: Some(config.crawl_queue_path.clone()),
+    };
+    let report = crawler.crawl(&mut index, &content_cache, &options)?;
+    storage::save(&index, &config.index_path)?;
+
+    println!(
+        "crawl complete in {:.2}s: {} fetched, {} indexed, {} unchanged, {} duplicate, {} robots-blocked, {} new links discovered",
+        started.elapsed().as_secs_f32(),
+        report.pages_fetched,
+        report.pages_indexed,
+        report.pages_unchanged,
+        report.pages_skipped_duplicate,
+        report.pages_skipped_robots,
+        report.links_discovered,
+    );
+    if report.queue_remaining > 0 {
+        println!(
+            "{} URL(s) remain queued; run `nexus crawl --resume` to continue",
+            report.queue_remaining
+        );
+    }
+    if !report.errors.is_empty() {
+        println!("{} error(s):", report.errors.len());
+        for e in report.errors.iter().take(10) {
+            println!("  - {}", e);
+        }
+        if report.errors.len() > 10 {
+            println!("  ... and {} more", report.errors.len() - 10);
+        }
+    }
+    Ok(())
+}
+
+fn crawler_max_pages(config: &Config, override_value: Option<usize>) -> usize {
+    override_value.unwrap_or(config.web_crawl.max_pages)
+}
+
+fn crawler_max_depth(config: &Config, override_value: Option<u32>) -> u32 {
+    override_value.unwrap_or(config.web_crawl.max_depth)
+}
+
+fn cmd_pagerank(config: &Config) -> Result<()> {
+    let mut index = load_index(config)?;
+    if index.web.is_empty() {
+        println!("no crawled web pages in the index; run `nexus crawl <url>` first");
+        return Ok(());
+    }
+    let started = Instant::now();
+    crate::webdoc::build_incoming_links(&mut index.web);
+    crate::webdoc::pagerank::compute_and_store(&mut index.web, crate::webdoc::pagerank::DEFAULT_DAMPING);
+    storage::save(&index, &config.index_path)?;
+
+    let mut ranked: Vec<(String, f32)> = index
+        .web
+        .iter()
+        .map(|(_, meta)| (meta.url.clone(), meta.pagerank))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!(
+        "recomputed PageRank for {} page(s) in {:.2}s",
+        index.web.len(),
+        started.elapsed().as_secs_f32()
+    );
+    println!("top pages by PageRank:");
+    for (url, score) in ranked.iter().take(10) {
+        println!("  {:.5}  {}", score, url);
+    }
+    Ok(())
+}
+
+fn cmd_click(config: &Config, query_str: &str, rank: usize) -> Result<()> {
+    if rank == 0 {
+        return Err(crate::error::NexusError::Other(
+            "rank must be 1-based (the number shown by `nexus search`)".to_string(),
+        ));
+    }
+    let index = load_index(config)?;
+    let existing_clicks = ClickLog::load(&config.clicks_path).unwrap_or_default();
+    let ast = query::parse(query_str)?;
+    // Re-running search deterministically reproduces the same ranking the
+    // user saw (absent an index change in between), so we don't need to
+    // separately persist "last shown results" state just to resolve which
+    // document a rank number refers to.
+    let results = crate::search::search(
+        &index,
+        &ast,
+        &config.ranking,
+        0,
+        rank,
+        Some(&existing_clicks),
+    );
+    let Some(result) = results.get(rank - 1) else {
+        println!("no result at rank {} for '{}'", rank, query_str);
+        return Ok(());
+    };
+
+    let mut clicks = existing_clicks;
+    clicks.record(result.doc_id);
+    clicks.save(&config.clicks_path)?;
+    println!("recorded click on: {}", result.path.display());
+    Ok(())
+}
+
+fn cmd_serve(config: &Config, bind: &str) -> Result<()> {
+    crate::api::serve(bind, config)
 }
