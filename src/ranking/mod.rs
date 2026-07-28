@@ -11,6 +11,8 @@
 pub mod bm25;
 pub mod tfidf;
 
+use log::debug;
+
 use crate::config::RankingConfig;
 use crate::document::DocId;
 use crate::index::Index;
@@ -151,6 +153,12 @@ pub fn score_document(
         * domain_quality_boost
         * click_boost;
 
+    debug!(
+        "score doc_id={}: bm25={:.4} filename={:.4} exact={:.4} recency={:.4} pagerank={:.4} url={:.4} domain={:.4} click={:.4} final={:.4}",
+        doc_id, bm25_total, filename_boost, exact_match_boost, recency_boost,
+        pagerank_boost, url_match_boost, domain_quality_boost, click_boost, final_score
+    );
+
     Some(ScoreExplanation {
         bm25_score: bm25_total,
         filename_boost,
@@ -225,12 +233,13 @@ mod integration_tests {
                 domain: "wikipedia.org".to_string(),
                 title: "Rust Ownership Guide".to_string(),
                 meta_description: String::new(),
-            lang: None,
-            author: None,
+                lang: None,
+                author: None,
                 content_type: "html".to_string(),
                 fetched_unix: 0,
                 etag: None,
                 last_modified: None,
+            redirect_chain: Vec::new(),
                 simhash: 0,
                 depth: 0,
                 outgoing: Vec::new(),
@@ -254,11 +263,13 @@ mod integration_tests {
         let config = RankingConfig::default();
 
         let mut clicks = crate::clicks::ClickLog::default();
-        let no_clicks = score_document(&index, doc_id, &match_info, &config, 0, Some(&clicks)).unwrap();
+        let no_clicks =
+            score_document(&index, doc_id, &match_info, &config, 0, Some(&clicks)).unwrap();
         clicks.record(doc_id);
         clicks.record(doc_id);
         clicks.record(doc_id);
-        let with_clicks = score_document(&index, doc_id, &match_info, &config, 0, Some(&clicks)).unwrap();
+        let with_clicks =
+            score_document(&index, doc_id, &match_info, &config, 0, Some(&clicks)).unwrap();
         assert!(with_clicks.final_score > no_clicks.final_score);
     }
 }

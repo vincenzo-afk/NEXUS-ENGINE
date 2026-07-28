@@ -118,6 +118,19 @@ pub enum Commands {
         /// Ignore robots.txt (not recommended; only for infrastructure you control).
         #[arg(long)]
         ignore_robots: bool,
+        /// Keep running, re-crawling the same seeds repeatedly on a fixed
+        /// interval, instead of exiting after one pass. Intended to be
+        /// run under a process supervisor (systemd, a container restart
+        /// policy, `pm2`, etc.) for continuous/scheduled crawling — this
+        /// flag makes the process itself loop, it does not daemonize or
+        /// install a system-level schedule on its own.
+        #[arg(long)]
+        watch: bool,
+        /// Interval, in seconds, between crawl passes when `--watch` is
+        /// set. Defaults to 1 hour, a reasonable default for keeping a
+        /// news/blog site's RSS-discovered content fresh without hammering it.
+        #[arg(long, default_value_t = 3600)]
+        interval: u64,
     },
 
     /// Recompute PageRank scores over the crawled link graph.
@@ -139,4 +152,40 @@ pub enum Commands {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
     },
+
+    /// Start the WebSocket search-as-you-type server.
+    ServeWs {
+        /// Address to bind to.
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        bind: String,
+    },
+
+    /// Configure Tor proxy for private crawling.
+    Tor {
+        /// Enable Tor proxy.
+        #[arg(long)]
+        enable: bool,
+        /// Disable Tor proxy.
+        #[arg(long)]
+        disable: bool,
+        /// Tor SOCKS5 proxy address (host:port).
+        #[arg(long)]
+        proxy: Option<String>,
+        /// Check if Tor is reachable.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// Run performance benchmarks.
+    Benchmark {
+        /// Number of search iterations.
+        #[arg(long, default_value_t = 100)]
+        iterations: usize,
+        /// File with queries (one per line) to benchmark.
+        #[arg(long)]
+        queries: Option<PathBuf>,
+    },
+
+    /// Show privacy policy information.
+    PrivacyPolicy,
 }

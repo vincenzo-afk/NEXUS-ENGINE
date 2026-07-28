@@ -12,6 +12,7 @@
 pub mod pagerank;
 
 use crate::document::DocId;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -50,6 +51,13 @@ pub struct WebPageMeta {
     pub etag: Option<String>,
     /// `Last-Modified` from the last fetch, used for conditional re-fetching.
     pub last_modified: Option<String>,
+    /// Every URL visited while following redirects to reach this page's
+    /// final `url`, in order. Empty if the page was served directly with
+    /// no redirect. Useful for auditing redirect loops/chains and for
+    /// detecting when a site has moved its content (a long chain, or a
+    /// chain ending on a different domain, is a signal worth surfacing).
+    #[serde(default)]
+    pub redirect_chain: Vec<String>,
     /// SimHash fingerprint of the extracted text, for near-duplicate
     /// detection against other crawled pages.
     pub simhash: u64,
@@ -96,12 +104,17 @@ impl WebMetaStore {
 
     /// Inserts or replaces the metadata for `doc_id`.
     pub fn insert(&mut self, doc_id: DocId, meta: WebPageMeta) {
+        debug!(
+            "WebMetaStore::insert(doc_id={}, url='{}')",
+            doc_id, meta.url
+        );
         self.url_to_id.insert(meta.url.clone(), doc_id);
         self.meta.insert(doc_id, meta);
     }
 
     /// Removes metadata for `doc_id`, if present.
     pub fn remove(&mut self, doc_id: DocId) -> Option<WebPageMeta> {
+        debug!("WebMetaStore::remove(doc_id={})", doc_id);
         if let Some(meta) = self.meta.remove(&doc_id) {
             self.url_to_id.remove(&meta.url);
             Some(meta)
@@ -112,7 +125,13 @@ impl WebMetaStore {
 
     /// Looks up metadata by document ID.
     pub fn get(&self, doc_id: DocId) -> Option<&WebPageMeta> {
-        self.meta.get(&doc_id)
+        let result = self.meta.get(&doc_id);
+        debug!(
+            "WebMetaStore::get(doc_id={}) -> {}",
+            doc_id,
+            if result.is_some() { "hit" } else { "miss" }
+        );
+        result
     }
 
     /// Mutable lookup by document ID.
@@ -146,6 +165,7 @@ impl WebMetaStore {
 /// completes, since a page's inbound links can't be known until the pages
 /// linking to it have themselves been crawled and indexed.
 pub fn build_incoming_links(store: &mut WebMetaStore) {
+    debug!("building incoming links for {} pages", store.len());
     let mut incoming_by_target: HashMap<DocId, Vec<LinkEdge>> = HashMap::new();
     for (doc_id, meta) in store.iter() {
         for edge in &meta.outgoing {
@@ -166,6 +186,7 @@ pub fn build_incoming_links(store: &mut WebMetaStore) {
             meta.incoming = incoming;
         }
     }
+    debug!("incoming links built");
 }
 
 #[cfg(test)]
@@ -184,6 +205,7 @@ mod tests {
             fetched_unix: 0,
             etag: None,
             last_modified: None,
+            redirect_chain: Vec::new(),
             simhash: 0,
             depth: 0,
             outgoing: Vec::new(),

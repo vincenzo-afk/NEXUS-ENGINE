@@ -7,6 +7,7 @@
 
 use crate::document::DocId;
 use crate::error::{NexusError, Result};
+use log::debug;
 use std::path::{Path, PathBuf};
 
 /// A directory of `{doc_id}.txt` files holding cached page text.
@@ -27,6 +28,7 @@ impl ContentCache {
 
     /// Stores `text` for `doc_id`, overwriting any previous content.
     pub fn store(&self, doc_id: DocId, text: &str) -> Result<()> {
+        debug!("storing doc_id={} ({} bytes)", doc_id, text.len());
         std::fs::create_dir_all(&self.dir).map_err(|e| NexusError::io(&self.dir, e))?;
         let path = self.path_for(doc_id);
         std::fs::write(&path, text).map_err(|e| NexusError::io(&path, e))
@@ -34,6 +36,7 @@ impl ContentCache {
 
     /// Loads cached text for `doc_id`, if present.
     pub fn load(&self, doc_id: DocId) -> Result<String> {
+        debug!("loading doc_id={}", doc_id);
         let path = self.path_for(doc_id);
         std::fs::read_to_string(&path).map_err(|e| NexusError::io(&path, e))
     }
@@ -42,6 +45,7 @@ impl ContentCache {
     /// missing file are swallowed, since "already gone" is an acceptable
     /// outcome for a cleanup operation.
     pub fn remove(&self, doc_id: DocId) {
+        debug!("removing doc_id={}", doc_id);
         let _ = std::fs::remove_file(self.path_for(doc_id));
     }
 
@@ -57,7 +61,8 @@ mod tests {
 
     #[test]
     fn stores_and_loads_content() {
-        let dir = std::env::temp_dir().join(format!("nexus-content-cache-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nexus-content-cache-test-{}", std::process::id()));
         let cache = ContentCache::new(dir.clone());
         cache.store(42, "hello world").unwrap();
         assert_eq!(cache.load(42).unwrap(), "hello world");

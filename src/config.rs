@@ -5,6 +5,7 @@
 //! are ignored, ranking behavior, and runtime tuning such as thread count.
 
 use crate::error::{NexusError, Result};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,28 @@ pub struct WebCrawlConfig {
     pub allowed_domains: Vec<String>,
     /// Maximum response body size, in bytes, that will be downloaded.
     pub max_page_size_bytes: u64,
+    /// Maximum number of pages fetched from any single domain within one
+    /// crawl run, regardless of the overall `max_pages` budget. Prevents
+    /// one large or infinitely-linking site (calendar pages, faceted
+    /// search results, a misbehaving CMS generating endless unique URLs,
+    /// etc.) from consuming the entire crawl budget and effectively
+    /// spamming the index with pages from one source. `0` means
+    /// unlimited (falls back to the overall `max_pages` budget only).
+    #[serde(default = "default_max_pages_per_domain")]
+    pub max_pages_per_domain: usize,
+    /// Whether to discover RSS/Atom feeds (via `<link rel="alternate">`
+    /// tags and well-known paths like `/feed`) and crawl their items at
+    /// elevated priority, similar to sitemap discovery.
+    #[serde(default = "default_true")]
+    pub discover_feeds: bool,
+}
+
+fn default_max_pages_per_domain() -> usize {
+    100
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for WebCrawlConfig {
@@ -117,6 +140,114 @@ impl Default for WebCrawlConfig {
             respect_robots: true,
             allowed_domains: Vec::new(),
             max_page_size_bytes: 10 * 1024 * 1024,
+            max_pages_per_domain: default_max_pages_per_domain(),
+            discover_feeds: true,
+        }
+    }
+}
+
+/// Privacy-related configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// Block sponsored/promoted results from appearing in search results.
+    pub block_sponsored_results: bool,
+    /// Disable filter bubble (personalized results based on history).
+    pub no_filter_bubble: bool,
+    /// Anonymize search queries before processing.
+    pub anonymize_queries: bool,
+    /// Disable telemetry and usage statistics collection.
+    pub disable_telemetry: bool,
+    /// Auto-delete search history after N days (None = never).
+    pub auto_delete_history_days: Option<u64>,
+    /// URL to the full privacy policy document.
+    pub privacy_policy_url: String,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        PrivacyConfig {
+            block_sponsored_results: true,
+            no_filter_bubble: true,
+            anonymize_queries: true,
+            disable_telemetry: true,
+            auto_delete_history_days: Some(90),
+            privacy_policy_url: "https://github.com/vincenzo-afk/NEXUS-ENGINE/blob/main/PRIVACY.md"
+                .to_string(),
+        }
+    }
+}
+
+/// API security configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Require authentication for API requests.
+    pub api_require_auth: bool,
+    /// Valid API keys for authenticated requests.
+    pub api_keys: Vec<String>,
+    /// Minimum TLS version for HTTPS connections.
+    pub tls_min_version: String,
+    /// Enable certificate pinning.
+    pub enable_certificate_pinning: bool,
+    /// Allowed CORS origins.
+    pub cors_allowed_origins: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            api_require_auth: false,
+            api_keys: Vec::new(),
+            tls_min_version: "1.2".to_string(),
+            enable_certificate_pinning: false,
+            cors_allowed_origins: vec!["http://localhost:8080".to_string()],
+        }
+    }
+}
+
+/// WebSocket search-as-you-type server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    /// Enable the WebSocket server.
+    pub enabled: bool,
+    /// Address to bind the WebSocket server to.
+    pub bind_address: String,
+    /// Maximum concurrent WebSocket connections.
+    pub max_connections: usize,
+    /// WebSocket message rate limit (per minute).
+    pub message_rate_limit: u64,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        WebSocketConfig {
+            enabled: false,
+            bind_address: "127.0.0.1:8081".to_string(),
+            max_connections: 100,
+            message_rate_limit: 60,
+        }
+    }
+}
+
+/// Tor proxy configuration for private web crawling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorProxyConfig {
+    /// Enable Tor proxy for all HTTP requests.
+    pub enabled: bool,
+    /// SOCKS5 proxy hostname.
+    pub proxy_host: String,
+    /// SOCKS5 proxy port.
+    pub proxy_port: u16,
+    /// How often to rotate Tor identity (in minutes).
+    pub identity_rotation_minutes: u64,
+}
+
+impl Default for TorProxyConfig {
+    fn default() -> Self {
+        TorProxyConfig {
+            enabled: false,
+            proxy_host: "127.0.0.1".to_string(),
+            proxy_port: 9050,
+            identity_rotation_minutes: 60,
         }
     }
 }
@@ -140,6 +271,18 @@ pub struct Config {
     /// Web crawler tunables.
     #[serde(default)]
     pub web_crawl: WebCrawlConfig,
+    /// Privacy configuration.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+    /// Security configuration.
+    #[serde(default)]
+    pub security: SecurityConfig,
+    /// WebSocket server configuration.
+    #[serde(default)]
+    pub websocket: WebSocketConfig,
+    /// Tor proxy configuration.
+    #[serde(default)]
+    pub tor: TorProxyConfig,
     /// Size, in entries, of the in-memory search-result cache.
     pub cache_size: usize,
     /// Number of worker threads used for crawling/indexing. `0` means "use
@@ -188,6 +331,10 @@ impl Default for Config {
             max_file_size_bytes: 25 * 1024 * 1024, // 25 MiB
             ranking: RankingConfig::default(),
             web_crawl: WebCrawlConfig::default(),
+            privacy: PrivacyConfig::default(),
+            security: SecurityConfig::default(),
+            websocket: WebSocketConfig::default(),
+            tor: TorProxyConfig::default(),
             cache_size: 256,
             thread_count: 0,
             index_path: default_index_path(),
@@ -243,8 +390,10 @@ impl Config {
     /// file at that location if none exists yet.
     pub fn load_or_create(path: &Path) -> Result<Config> {
         if path.exists() {
+            info!("loading config from {}", path.display());
             Config::load(path)
         } else {
+            info!("creating default config at {}", path.display());
             let config = Config::default();
             config.save(path)?;
             Ok(config)
@@ -253,27 +402,35 @@ impl Config {
 
     /// Loads and parses configuration from an existing TOML file.
     pub fn load(path: &Path) -> Result<Config> {
-        let contents =
-            std::fs::read_to_string(path).map_err(|e| NexusError::io(path, e))?;
-        toml::from_str(&contents).map_err(|e| NexusError::Config(e.to_string()))
+        info!("loading config from {}", path.display());
+        let contents = std::fs::read_to_string(path).map_err(|e| NexusError::io(path, e))?;
+        let config: Config =
+            toml::from_str(&contents).map_err(|e| NexusError::Config(e.to_string()))?;
+        info!("config loaded from {}", path.display());
+        Ok(config)
     }
 
     /// Serializes and writes this configuration to `path`, creating parent
     /// directories as needed.
     pub fn save(&self, path: &Path) -> Result<()> {
+        info!("saving config to {}", path.display());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
         }
         let contents =
             toml::to_string_pretty(self).map_err(|e| NexusError::Config(e.to_string()))?;
-        std::fs::write(path, contents).map_err(|e| NexusError::io(path, e))
+        std::fs::write(path, contents).map_err(|e| NexusError::io(path, e))?;
+        info!("config saved to {}", path.display());
+        Ok(())
     }
 
     /// Adds a folder to the indexed set, returning `false` if it was already present.
     pub fn add_folder(&mut self, folder: PathBuf) -> bool {
         if self.indexed_folders.contains(&folder) {
+            debug!("folder already indexed: {}", folder.display());
             false
         } else {
+            debug!("adding folder: {}", folder.display());
             self.indexed_folders.push(folder);
             true
         }
@@ -283,6 +440,12 @@ impl Config {
     pub fn remove_folder(&mut self, folder: &Path) -> bool {
         let before = self.indexed_folders.len();
         self.indexed_folders.retain(|f| f != folder);
-        self.indexed_folders.len() != before
+        let removed = self.indexed_folders.len() != before;
+        if removed {
+            debug!("removed folder: {}", folder.display());
+        } else {
+            debug!("folder not found: {}", folder.display());
+        }
+        removed
     }
 }

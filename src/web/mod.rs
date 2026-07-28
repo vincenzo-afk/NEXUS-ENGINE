@@ -4,6 +4,7 @@
 
 pub mod canonical;
 pub mod crawler;
+pub mod feed;
 pub mod http;
 pub mod queue;
 pub mod robots;

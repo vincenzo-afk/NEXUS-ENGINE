@@ -5,6 +5,7 @@ mod levenshtein;
 
 use crate::index::vocabulary::Vocabulary;
 pub use levenshtein::levenshtein_distance;
+use log::debug;
 
 /// A single spelling suggestion, with its distance from the queried term
 /// (lower is closer) so callers can decide how confident to be.
@@ -27,7 +28,9 @@ const MAX_SUGGESTION_DISTANCE: u32 = 2;
 /// Returns an empty vector if `term` is already present in the vocabulary,
 /// since no correction is needed.
 pub fn suggest(term: &str, vocabulary: &Vocabulary, limit: usize) -> Vec<Suggestion> {
+    debug!("spellcheck suggest: term='{}', limit={}", term, limit);
     if vocabulary.get(term).is_some() {
+        debug!("  term '{}' is already in vocabulary", term);
         return Vec::new();
     }
 
@@ -52,8 +55,17 @@ pub fn suggest(term: &str, vocabulary: &Vocabulary, limit: usize) -> Vec<Suggest
         })
         .collect();
 
-    candidates.sort_by(|a, b| a.distance.cmp(&b.distance).then_with(|| a.term.cmp(&b.term)));
+    candidates.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| a.term.cmp(&b.term))
+    });
     candidates.truncate(limit);
+    debug!(
+        "spellcheck: {} suggestions for '{}'",
+        candidates.len(),
+        term
+    );
     candidates
 }
 

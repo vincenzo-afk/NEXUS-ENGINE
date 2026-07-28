@@ -1,6 +1,8 @@
 //! Document store: `DocId -> DocumentMetadata`, plus the reverse path
 //! lookup needed for incremental re-indexing and deletion.
 
+use log::{debug, trace};
+
 use crate::document::{DocId, DocumentMetadata};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,11 +31,13 @@ impl DocumentStore {
     pub fn allocate_id(&mut self) -> DocId {
         let id = self.next_id;
         self.next_id += 1;
+        trace!("allocated doc_id={}", id);
         id
     }
 
     /// Inserts or replaces the metadata for `doc_id`.
     pub fn insert(&mut self, doc_id: DocId, metadata: DocumentMetadata) {
+        debug!("store insert doc_id={}", doc_id);
         self.path_to_id.insert(metadata.path.clone(), doc_id);
         self.documents.insert(doc_id, metadata);
     }
@@ -41,6 +45,7 @@ impl DocumentStore {
     /// Removes a document's metadata, returning it if present.
     pub fn remove(&mut self, doc_id: DocId) -> Option<DocumentMetadata> {
         if let Some(meta) = self.documents.remove(&doc_id) {
+            debug!("store remove doc_id={} ({:?})", doc_id, meta.path);
             self.path_to_id.remove(&meta.path);
             Some(meta)
         } else {

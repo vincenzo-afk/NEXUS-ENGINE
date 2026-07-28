@@ -2,6 +2,7 @@
 //! compact integer term IDs used everywhere else in the index for speed
 //! and memory efficiency.
 
+use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -31,6 +32,7 @@ impl Vocabulary {
             return id;
         }
         let id = self.id_to_term.len() as TermId;
+        trace!("new term \"{}\" -> id={}", term, id);
         self.id_to_term.push(term.to_string());
         self.term_to_id.insert(term.to_string(), id);
         id

@@ -5,6 +5,7 @@
 //! position (for phrase queries) and byte offset (for snippet
 //! highlighting).
 
+use log::trace;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// A single token extracted from text.
@@ -39,6 +40,7 @@ fn is_word_like(word: &str) -> bool {
 pub fn tokenize(text: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut position: u32 = 0;
+    trace!("tokenizing: '{}'", &text[..text.len().min(80)]);
 
     for (start, word) in text.unicode_word_indices() {
         if !is_word_like(word) {
@@ -54,6 +56,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
         position += 1;
     }
 
+    trace!("tokenization complete: {} tokens", tokens.len());
     tokens
 }
 
@@ -74,7 +77,10 @@ mod tests {
     fn positions_are_sequential() {
         let normalized = normalize("one two three");
         let tokens = tokenize(&normalized);
-        assert_eq!(tokens.iter().map(|t| t.position).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            tokens.iter().map(|t| t.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -82,6 +88,9 @@ mod tests {
         let normalized = normalize("rust parser");
         let tokens = tokenize(&normalized);
         let second = &tokens[1];
-        assert_eq!(&normalized[second.start_offset as usize..second.end_offset as usize], "parser");
+        assert_eq!(
+            &normalized[second.start_offset as usize..second.end_offset as usize],
+            "parser"
+        );
     }
 }

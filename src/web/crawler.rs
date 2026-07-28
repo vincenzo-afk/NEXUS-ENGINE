@@ -19,12 +19,14 @@ use crate::error::Result;
 use crate::formats::{self, DocumentFormat};
 use crate::html;
 use crate::index::Index;
+use crate::network::tor::TorConfig;
 use crate::storage::content_cache::ContentCache;
 use crate::web::canonical;
 use crate::web::http::{HttpClient, HttpConfig};
 use crate::web::queue::{priority, CrawlQueue};
 use crate::web::robots::RobotsTxt;
 use crate::webdoc::{self, LinkEdge, WebPageMeta};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,6 +59,11 @@ pub struct CrawlReport {
     pub pages_unchanged: usize,
     /// Number of distinct new links discovered and enqueued.
     pub links_discovered: usize,
+    /// Number of pages skipped because their domain had already hit
+    /// `max_pages_per_domain` for this crawl run.
+    pub pages_skipped_domain_budget: usize,
+    /// Number of RSS/Atom feeds discovered and parsed.
+    pub feeds_discovered: usize,
     /// Human-readable descriptions of non-fatal errors encountered
     /// (a failed fetch does not abort the whole crawl).
     pub errors: Vec<String>,
@@ -72,22 +79,36 @@ pub struct WebCrawler {
     http: HttpClient,
     config: WebCrawlConfig,
     robots_cache: HashMap<String, RobotsTxt>,
+    #[allow(dead_code)]
+    tor_config: Option<TorConfig>,
 }
 
 impl WebCrawler {
     /// Builds a crawler from `config`.
     pub fn new(config: WebCrawlConfig) -> Result<Self> {
+        Self::with_tor(config, None)
+    }
+
+    /// Builds a crawler with optional Tor proxy support.
+    pub fn with_tor(config: WebCrawlConfig, tor_config: Option<TorConfig>) -> Result<Self> {
+        let proxy_url = tor_config
+            .as_ref()
+            .filter(|t| t.enabled)
+            .map(|t| format!("socks5://{}", t.proxy_addr));
+
         let http = HttpClient::new(HttpConfig {
             user_agent: config.user_agent.clone(),
             timeout: Duration::from_secs(config.timeout_seconds),
             max_redirects: 10,
             max_retries: config.max_retries,
             retry_base_delay: Duration::from_millis(500),
+            proxy_url,
         })?;
         Ok(WebCrawler {
             http,
             config,
             robots_cache: HashMap::new(),
+            tor_config,
         })
     }
 
@@ -100,11 +121,17 @@ impl WebCrawler {
         options: &CrawlOptions,
     ) -> Result<CrawlReport> {
         let mut queue = match &options.queue_path {
-            Some(path) if path.exists() => {
-                CrawlQueue::load(path).unwrap_or_else(|_| CrawlQueue::new(self.config.default_delay_millis))
-            }
+            Some(path) if path.exists() => CrawlQueue::load(path)
+                .unwrap_or_else(|_| CrawlQueue::new(self.config.default_delay_millis)),
             _ => CrawlQueue::new(self.config.default_delay_millis),
         };
+
+        info!(
+            "starting crawl with {} seed(s), max_pages={}, max_depth={}",
+            options.seeds.len(),
+            self.config.max_pages,
+            self.config.max_depth
+        );
 
         let mut report = CrawlReport::default();
         // Links discovered on unchanged/duplicate/new pages whose targets
@@ -112,6 +139,8 @@ impl WebCrawler {
         // their target gets indexed later in this same crawl.
         let mut pending_links: HashMap<crate::document::DocId, Vec<(String, String)>> =
             HashMap::new();
+        let mut pages_per_domain: HashMap<String, usize> = HashMap::new();
+        let mut seen_feeds: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for seed in &options.seeds {
             let Some(url) = canonical::parse_canonical(seed) else {
@@ -119,7 +148,12 @@ impl WebCrawler {
                 continue;
             };
             self.seed_domain(&url, &mut queue, &mut report);
-            queue.push(url.to_string(), canonical::domain_of(&url), 0, priority::SEED);
+            queue.push(
+                url.to_string(),
+                canonical::domain_of(&url),
+                0,
+                priority::SEED,
+            );
         }
 
         while report.pages_fetched < self.config.max_pages {
@@ -131,11 +165,26 @@ impl WebCrawler {
                 // empty. In a real long-running crawl we'd sleep and
                 // retry; for a bounded CLI run we treat "nothing ready"
                 // as "done for now" and let the queue persist for resume.
+                debug!("no entries ready (rate-limited), pausing crawl");
                 break;
             };
 
+            debug!("fetching: {}", entry.url);
+
             if !self.domain_allowed(&entry.domain) {
                 continue;
+            }
+
+            if self.config.max_pages_per_domain > 0 {
+                let count = pages_per_domain.get(&entry.domain).copied().unwrap_or(0);
+                if count >= self.config.max_pages_per_domain {
+                    debug!(
+                        "domain '{}' hit its per-domain crawl budget ({} pages), skipping {}",
+                        entry.domain, self.config.max_pages_per_domain, entry.url
+                    );
+                    report.pages_skipped_domain_budget += 1;
+                    continue;
+                }
             }
 
             let Ok(url) = Url::parse(&entry.url) else {
@@ -168,23 +217,28 @@ impl WebCrawler {
                 Ok(None) => {
                     report.pages_fetched += 1;
                     report.pages_unchanged += 1;
+                    *pages_per_domain.entry(entry.domain.clone()).or_insert(0) += 1;
                     continue;
                 }
                 Err(e) => {
+                    warn!("failed to fetch {}: {}", entry.url, e);
                     report.errors.push(format!("{}: {}", entry.url, e));
                     continue;
                 }
             };
 
             report.pages_fetched += 1;
+            *pages_per_domain.entry(entry.domain.clone()).or_insert(0) += 1;
 
             if response.status >= 400 {
+                warn!("{} returned HTTP {}", entry.url, response.status);
                 report
                     .errors
                     .push(format!("{}: HTTP {}", entry.url, response.status));
                 continue;
             }
             if (response.bytes.len() as u64) > self.config.max_page_size_bytes {
+                warn!("{} exceeds max page size, skipped", entry.url);
                 report
                     .errors
                     .push(format!("{}: exceeds max page size, skipped", entry.url));
@@ -197,70 +251,84 @@ impl WebCrawler {
                 .map(DocumentFormat::from_content_type)
                 .unwrap_or(DocumentFormat::Html);
 
-            let (indexable_text, discovered_links, title, meta_description, lang, author) = match format {
-                DocumentFormat::Html => {
-                    let extracted = html::extract(&response.body);
-                    let links: Vec<(String, String)> = extracted
-                        .links
-                        .iter()
-                        .filter(|l| !l.nofollow)
-                        .filter_map(|l| {
-                            canonical::resolve(&url, &l.href)
-                                .map(|resolved| (resolved.to_string(), l.anchor_text.clone()))
-                        })
-                        .collect();
-                    (
-                        extracted.indexable_text(),
-                        links,
-                        extracted.title,
-                        extracted.meta_description,
-                        extracted.lang,
-                        extracted.author,
-                    )
-                }
-                DocumentFormat::Markdown => (
-                    formats::extract_markdown(&response.body),
-                    Vec::new(),
-                    String::new(),
-                    String::new(),
-                    None,
-                    None,
-                ),
-                DocumentFormat::Json => (
-                    formats::extract_json(&response.body),
-                    Vec::new(),
-                    String::new(),
-                    String::new(),
-                    None,
-                    None,
-                ),
-                DocumentFormat::Xml => (
-                    formats::extract_xml(&response.body),
-                    Vec::new(),
-                    String::new(),
-                    String::new(),
-                    None,
-                    None,
-                ),
-                DocumentFormat::Pdf => (
-                    formats::extract_pdf(&response.bytes),
-                    Vec::new(),
-                    String::new(),
-                    String::new(),
-                    None,
-                    None,
-                ),
-                DocumentFormat::PlainText => (
-                    response.body.clone(),
-                    Vec::new(),
-                    String::new(),
-                    String::new(),
-                    None,
-                    None,
-                ),
-            };
+            let (indexable_text, discovered_links, title, meta_description, lang, author, feed_urls) =
+                match format {
+                    DocumentFormat::Html => {
+                        let extracted = html::extract(&response.body);
+                        let links: Vec<(String, String)> = extracted
+                            .links
+                            .iter()
+                            .filter(|l| !l.nofollow)
+                            .filter_map(|l| {
+                                canonical::resolve(&url, &l.href)
+                                    .map(|resolved| (resolved.to_string(), l.anchor_text.clone()))
+                            })
+                            .collect();
+                        let feed_urls: Vec<String> = extracted
+                            .feed_urls
+                            .iter()
+                            .filter_map(|href| canonical::resolve(&url, href))
+                            .map(|u| u.to_string())
+                            .collect();
+                        (
+                            extracted.indexable_text(),
+                            links,
+                            extracted.title,
+                            extracted.meta_description,
+                            extracted.lang,
+                            extracted.author,
+                            feed_urls,
+                        )
+                    }
+                    DocumentFormat::Markdown => (
+                        formats::extract_markdown(&response.body),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Json => (
+                        formats::extract_json(&response.body),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Xml => (
+                        formats::extract_xml(&response.body),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Pdf => (
+                        formats::extract_pdf(&response.bytes),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::PlainText => (
+                        response.body.clone(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                };
 
             if indexable_text.trim().is_empty() {
+                warn!("{}: no extractable text, skipped", entry.url);
                 report
                     .errors
                     .push(format!("{}: no extractable text, skipped", entry.url));
@@ -269,6 +337,7 @@ impl WebCrawler {
 
             if let Some(dup_id) = index.duplicates.find_duplicate(&indexable_text) {
                 if Some(dup_id) != existing_id {
+                    debug!("{}: duplicate of doc_id={}, skipping", entry.url, dup_id);
                     report.pages_skipped_duplicate += 1;
                     continue;
                 }
@@ -277,7 +346,11 @@ impl WebCrawler {
             let now = now_unix();
             let metadata = DocumentMetadata {
                 path: PathBuf::from(&entry.url),
-                file_name: if title.is_empty() { entry.url.clone() } else { title.clone() },
+                file_name: if title.is_empty() {
+                    entry.url.clone()
+                } else {
+                    title.clone()
+                },
                 extension: format.label().to_string(),
                 size_bytes: response.bytes.len() as u64,
                 modified_unix: now,
@@ -302,6 +375,7 @@ impl WebCrawler {
                 fetched_unix: now,
                 etag: response.etag,
                 last_modified: response.last_modified,
+                redirect_chain: response.redirect_chain.clone(),
                 simhash: SimHash::compute(&indexable_text).0,
                 depth: entry.depth,
                 outgoing: Vec::new(),
@@ -310,21 +384,32 @@ impl WebCrawler {
             };
             index.web.insert(doc_id, web_meta);
             report.pages_indexed += 1;
+            debug!("indexed doc_id={} from {}", doc_id, entry.url);
 
             if !discovered_links.is_empty() {
                 pending_links.insert(doc_id, discovered_links.clone());
+            }
+
+            if self.config.discover_feeds {
+                for feed_url in &feed_urls {
+                    if seen_feeds.insert(feed_url.clone()) {
+                        self.discover_and_enqueue_feed(feed_url, &mut queue, &mut report);
+                    }
+                }
             }
 
             if entry.depth < self.config.max_depth {
                 for (link_url, _) in &discovered_links {
                     if let Ok(parsed) = Url::parse(link_url) {
                         let domain = canonical::domain_of(&parsed);
-                        if self.domain_allowed(&domain) && queue.push(
-                            link_url.clone(),
-                            domain,
-                            entry.depth + 1,
-                            priority::DISCOVERED,
-                        ) {
+                        if self.domain_allowed(&domain)
+                            && queue.push(
+                                link_url.clone(),
+                                domain,
+                                entry.depth + 1,
+                                priority::DISCOVERED,
+                            )
+                        {
                             report.links_discovered += 1;
                         }
                     }
@@ -363,6 +448,11 @@ impl WebCrawler {
             }
         }
 
+        info!("crawl complete: {} fetched, {} indexed, {} unchanged, {} duplicates skipped, {} robots-skipped, {} domain-budget-skipped, {} feeds discovered, {} links discovered, {} errors, {} remaining in queue",
+            report.pages_fetched, report.pages_indexed, report.pages_unchanged,
+            report.pages_skipped_duplicate, report.pages_skipped_robots, report.pages_skipped_domain_budget,
+            report.feeds_discovered, report.links_discovered, report.errors.len(), report.queue_remaining);
+
         Ok(report)
     }
 
@@ -376,13 +466,66 @@ impl WebCrawler {
         }
 
         let sitemap_urls: Vec<String> = if robots.sitemaps.is_empty() {
-            vec![format!("{}://{}/sitemap.xml", url.scheme(), url.host_str().unwrap_or(""))]
+            vec![format!(
+                "{}://{}/sitemap.xml",
+                url.scheme(),
+                url.host_str().unwrap_or("")
+            )]
         } else {
             robots.sitemaps.clone()
         };
 
-        for sitemap_url in sitemap_urls {
-            self.enqueue_sitemap(&sitemap_url, queue, report, 0);
+        debug!(
+            "seed domain '{}': {} sitemap URL(s) to process",
+            canonical::domain_of(url),
+            sitemap_urls.len()
+        );
+        for sitemap_url in &sitemap_urls {
+            self.enqueue_sitemap(sitemap_url, queue, report, 0);
+        }
+
+        if self.config.discover_feeds {
+            let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+            for well_known in ["/feed", "/feed.xml", "/rss.xml", "/atom.xml", "/rss"] {
+                let feed_url = format!("{origin}{well_known}");
+                self.discover_and_enqueue_feed(&feed_url, queue, report);
+            }
+        }
+    }
+
+    /// Fetches and parses a feed at `feed_url`, enqueueing every item's
+    /// link at [`priority::FEED`]. Silently does nothing if the URL
+    /// doesn't exist or isn't a feed — this is used both for guessed
+    /// well-known paths (most of which won't exist on any given site) and
+    /// for feed URLs a page explicitly declared, so a 404 here is
+    /// expected and not worth logging as an error.
+    fn discover_and_enqueue_feed(&self, feed_url: &str, queue: &mut CrawlQueue, report: &mut CrawlReport) {
+        let Ok(response) = self.http.get(feed_url) else {
+            return;
+        };
+        if response.status >= 400 {
+            return;
+        }
+        let parsed = crate::web::feed::parse(&response.body);
+        if parsed.items.is_empty() {
+            return;
+        }
+        let Ok(feed_base) = Url::parse(feed_url) else {
+            return;
+        };
+
+        report.feeds_discovered += 1;
+        info!("discovered feed: {} ({} item(s))", feed_url, parsed.items.len());
+
+        for item in &parsed.items {
+            if let Some(resolved) = canonical::resolve(&feed_base, &item.url) {
+                let domain = canonical::domain_of(&resolved);
+                if self.domain_allowed(&domain)
+                    && queue.push(resolved.to_string(), domain, 0, priority::FEED)
+                {
+                    report.links_discovered += 1;
+                }
+            }
         }
     }
 
@@ -394,14 +537,27 @@ impl WebCrawler {
         recursion_depth: u32,
     ) {
         if recursion_depth > 2 {
+            debug!("sitemap recursion depth limit reached for {}", sitemap_url);
             return;
         }
         let Ok(response) = self.http.get(sitemap_url) else {
+            warn!("failed to fetch sitemap: {}", sitemap_url);
             return;
         };
         if response.status >= 400 {
+            warn!("sitemap {} returned HTTP {}", sitemap_url, response.status);
             return;
         }
+        info!(
+            "discovered sitemap: {} ({} URLs, {} nested)",
+            sitemap_url,
+            response
+                .body
+                .lines()
+                .filter(|l| l.contains("<loc>"))
+                .count(),
+            response.body.matches("<sitemap>").count()
+        );
         let parsed = crate::web::sitemap::parse(&response.body);
         for page_url in parsed.urls {
             if let Some(canonical_url) = canonical::parse_canonical(&page_url) {
@@ -411,24 +567,30 @@ impl WebCrawler {
                 }
             }
         }
+        debug!(
+            "sitemap {} yielded {} new URLs",
+            sitemap_url, report.links_discovered
+        );
         for nested in parsed.nested_sitemaps {
             self.enqueue_sitemap(&nested, queue, report, recursion_depth + 1);
         }
     }
 
     fn robots_for(&mut self, url: &Url) -> RobotsTxt {
-        let origin = format!(
-            "{}://{}",
-            url.scheme(),
-            url.host_str().unwrap_or_default()
-        );
+        let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         if let Some(cached) = self.robots_cache.get(&origin) {
             return cached.clone();
         }
         let robots_url = format!("{origin}/robots.txt");
         let robots = match self.http.get(&robots_url) {
-            Ok(resp) if resp.status < 400 => RobotsTxt::parse(&resp.body),
-            _ => RobotsTxt::allow_all(),
+            Ok(resp) if resp.status < 400 => {
+                info!("fetched robots.txt from {}", robots_url);
+                RobotsTxt::parse(&resp.body)
+            }
+            _ => {
+                debug!("robots.txt not available at {}, allowing all", robots_url);
+                RobotsTxt::allow_all()
+            }
         };
         self.robots_cache.insert(origin, robots.clone());
         robots

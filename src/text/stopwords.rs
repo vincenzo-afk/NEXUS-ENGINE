@@ -6,6 +6,7 @@
 //! token stream used for phrase-position tracking; filtering happens at
 //! the point of indexing (see [`crate::index::inverted::InvertedIndex`]).
 
+use log::trace;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -13,10 +14,10 @@ use std::sync::OnceLock;
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in", "on", "at",
     "for", "with", "by", "from", "up", "down", "is", "are", "was", "were", "be", "been", "being",
-    "this", "that", "these", "those", "it", "its", "as", "into", "than", "so", "such", "no",
-    "nor", "not", "only", "own", "same", "too", "very", "can", "will", "just", "do", "does",
-    "did", "doing", "have", "has", "had", "having", "i", "you", "he", "she", "we", "they", "them",
-    "his", "her", "their", "our", "my", "your",
+    "this", "that", "these", "those", "it", "its", "as", "into", "than", "so", "such", "no", "nor",
+    "not", "only", "own", "same", "too", "very", "can", "will", "just", "do", "does", "did",
+    "doing", "have", "has", "had", "having", "i", "you", "he", "she", "we", "they", "them", "his",
+    "her", "their", "our", "my", "your",
 ];
 
 static STOPWORD_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
@@ -24,9 +25,11 @@ static STOPWORD_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
 /// Returns `true` if `word` is a stop word. `word` is expected to already be
 /// normalized (lowercase).
 pub fn is_stopword(word: &str) -> bool {
-    STOPWORD_SET
+    let result = STOPWORD_SET
         .get_or_init(|| STOPWORDS.iter().copied().collect())
-        .contains(word)
+        .contains(word);
+    trace!("is_stopword('{}') = {}", word, result);
+    result
 }
 
 #[cfg(test)]

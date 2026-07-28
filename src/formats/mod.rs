@@ -5,6 +5,7 @@
 //! since a single malformed file should never take down a crawl or a
 //! bulk-index run.
 
+use log::debug;
 use pulldown_cmark::{Event, Parser as MdParser, Tag};
 
 /// Which extractor to use for a document, inferred from a file extension
@@ -41,7 +42,11 @@ impl DocumentFormat {
     /// Infers a format from an HTTP `Content-Type` header value (may
     /// include a `; charset=...` suffix, which is ignored).
     pub fn from_content_type(content_type: &str) -> DocumentFormat {
-        let base = content_type.split(';').next().unwrap_or(content_type).trim();
+        let base = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim();
         match base {
             "text/html" | "application/xhtml+xml" => DocumentFormat::Html,
             "text/markdown" | "text/x-markdown" => DocumentFormat::Markdown,
@@ -72,6 +77,7 @@ impl DocumentFormat {
 /// blocks are kept (code is often exactly what's being searched for) but
 /// fence markers are dropped; links keep their visible text.
 pub fn extract_markdown(source: &str) -> String {
+    debug!("extracting markdown ({} bytes)", source.len());
     let parser = MdParser::new(source);
     let mut out = String::with_capacity(source.len());
     for event in parser {
@@ -95,6 +101,7 @@ pub fn extract_markdown(source: &str) -> String {
 /// with noise like "true" and "42"), but keys are included since they're
 /// often meaningful field names (`"error_message": "..."`).
 pub fn extract_json(source: &str) -> String {
+    debug!("extracting JSON ({} bytes)", source.len());
     match serde_json::from_str::<serde_json::Value>(source) {
         Ok(value) => {
             let mut out = String::new();
@@ -180,9 +187,15 @@ mod tests {
 
     #[test]
     fn format_inferred_from_extension() {
-        assert_eq!(DocumentFormat::from_extension("md"), DocumentFormat::Markdown);
+        assert_eq!(
+            DocumentFormat::from_extension("md"),
+            DocumentFormat::Markdown
+        );
         assert_eq!(DocumentFormat::from_extension("pdf"), DocumentFormat::Pdf);
-        assert_eq!(DocumentFormat::from_extension("xyz"), DocumentFormat::PlainText);
+        assert_eq!(
+            DocumentFormat::from_extension("xyz"),
+            DocumentFormat::PlainText
+        );
     }
 
     #[test]

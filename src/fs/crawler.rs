@@ -6,6 +6,7 @@
 //! the pipeline (see [`crate::document`]).
 
 use crate::config::Config;
+use log::{debug, info};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
@@ -68,6 +69,7 @@ fn is_hidden(entry: &DirEntry) -> bool {
 /// entirely (not just their files), so ignoring `node_modules` avoids
 /// descending into it at all.
 pub fn crawl_folder(root: &Path, options: &CrawlOptions) -> Vec<CrawledFile> {
+    info!("crawl started: {}", root.display());
     let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
         // Always allow the root itself.
         if entry.depth() == 0 {
@@ -123,5 +125,11 @@ pub fn crawl_folder(root: &Path, options: &CrawlOptions) -> Vec<CrawledFile> {
         });
     }
 
+    debug!(
+        "crawl complete: {} files found from {}",
+        results.len(),
+        root.display()
+    );
+    info!("crawl completed: {}", root.display());
     results
 }

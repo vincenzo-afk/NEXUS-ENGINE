@@ -9,7 +9,10 @@ use crate::document::{is_supported, Document};
 use crate::error::{NexusError, Result};
 use crate::fs::CrawledFile;
 use crate::index::Index;
-use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use log::{debug, info};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
@@ -18,6 +21,7 @@ use std::time::Duration;
 /// live [`RecommendedWatcher`] (which must be kept alive for watching to
 /// continue) and a channel of raw filesystem events.
 pub fn start_watching(config: &Config) -> Result<(RecommendedWatcher, Receiver<Event>)> {
+    info!("starting filesystem watcher");
     let (tx, rx) = channel();
 
     let mut watcher = RecommendedWatcher::new(
@@ -31,9 +35,12 @@ pub fn start_watching(config: &Config) -> Result<(RecommendedWatcher, Receiver<E
     .map_err(|e| NexusError::Watcher(e.to_string()))?;
 
     for folder in &config.indexed_folders {
+        info!("  watching: {}", folder.display());
         watcher
             .watch(folder, RecursiveMode::Recursive)
-            .map_err(|e| NexusError::Watcher(format!("failed to watch {}: {}", folder.display(), e)))?;
+            .map_err(|e| {
+                NexusError::Watcher(format!("failed to watch {}: {}", folder.display(), e))
+            })?;
     }
 
     Ok((watcher, rx))
@@ -44,6 +51,7 @@ pub fn start_watching(config: &Config) -> Result<(RecommendedWatcher, Receiver<E
 /// description of what changed, or `None` if the event required no action
 /// (e.g. it referenced an ignored file type).
 pub fn apply_event(index: &mut Index, config: &Config, event: &Event) -> Option<String> {
+    debug!("event: {:?} paths={:?}", event.kind, event.paths);
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(_) => {
             let mut summary = None;
@@ -58,12 +66,16 @@ pub fn apply_event(index: &mut Index, config: &Config, event: &Event) -> Option<
             let mut summary = None;
             for path in &event.paths {
                 if index.remove_by_path(path) {
+                    debug!("removed from index: {}", path.display());
                     summary = Some(format!("removed: {}", path.display()));
                 }
             }
             summary
         }
-        _ => None,
+        _ => {
+            debug!("ignored event: {:?}", event.kind);
+            None
+        }
     }
 }
 
@@ -71,10 +83,13 @@ pub fn apply_event(index: &mut Index, config: &Config, event: &Event) -> Option<
 /// passes the configured ignore rules. Directories and unsupported files
 /// are silently skipped.
 fn reindex_path(index: &mut Index, config: &Config, path: &Path) -> Option<String> {
+    debug!("reindex_path: {}", path.display());
     if !path.is_file() || !is_supported(path) {
+        debug!("  skipped (not a supported file)");
         return None;
     }
     if is_ignored(path, config) {
+        debug!("  skipped (ignored)");
         return None;
     }
 

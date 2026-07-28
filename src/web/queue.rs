@@ -5,6 +5,7 @@
 //! rather than starting over.
 
 use crate::error::{NexusError, Result};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -47,6 +48,11 @@ pub mod priority {
     pub const SEED: i32 = 100;
     /// A URL discovered via `sitemap.xml`.
     pub const SITEMAP: i32 = 75;
+    /// A URL discovered via an RSS/Atom feed item — typically fresh
+    /// content worth prioritizing over ordinary discovered links, but
+    /// below sitemap entries (which represent a site's authoritative,
+    /// complete page list rather than just its recent items).
+    pub const FEED: i32 = 50;
     /// A URL discovered by following an in-page link.
     pub const DISCOVERED: i32 = 10;
 }
@@ -88,11 +94,12 @@ impl CrawlQueue {
         }
         self.seen.insert(url.clone());
         self.heap.push(QueueEntry {
-            url,
+            url: url.clone(),
             domain,
             depth,
             priority,
         });
+        debug!("enqueued {} (priority={}, depth={})", url, priority, depth);
         true
     }
 
@@ -105,7 +112,8 @@ impl CrawlQueue {
 
     /// Sets the crawl-delay (from `robots.txt`) for a domain.
     pub fn set_domain_delay(&mut self, domain: &str, delay_millis: u64) {
-        self.domain_delay_millis.insert(domain.to_string(), delay_millis);
+        self.domain_delay_millis
+            .insert(domain.to_string(), delay_millis);
     }
 
     /// Pops the next entry that is both highest-priority and whose domain
@@ -124,7 +132,11 @@ impl CrawlQueue {
                 .get(&entry.domain)
                 .copied()
                 .unwrap_or(self.default_delay_millis);
-            let last = self.last_fetch_millis.get(&entry.domain).copied().unwrap_or(0);
+            let last = self
+                .last_fetch_millis
+                .get(&entry.domain)
+                .copied()
+                .unwrap_or(0);
             if now.saturating_sub(last) >= delay as u128 {
                 ready = Some(entry);
                 break;
@@ -139,6 +151,10 @@ impl CrawlQueue {
 
         if let Some(entry) = &ready {
             self.last_fetch_millis.insert(entry.domain.clone(), now);
+            debug!(
+                "dequeued {} (domain={}, depth={})",
+                entry.url, entry.domain, entry.depth
+            );
         }
         ready
     }
@@ -165,13 +181,31 @@ impl CrawlQueue {
             std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
         }
         let bytes = bincode::serialize(self).map_err(NexusError::Serialize)?;
-        std::fs::write(path, bytes).map_err(|e| NexusError::io(path, e))
+        std::fs::write(path, bytes).map_err(|e| {
+            warn!("failed to save queue to {}: {}", path.display(), e);
+            NexusError::io(path, e)
+        })?;
+        info!(
+            "saved queue with {} entries to {}",
+            self.len(),
+            path.display()
+        );
+        Ok(())
     }
 
     /// Loads a previously-saved queue from `path`.
     pub fn load(path: &Path) -> Result<CrawlQueue> {
         let bytes = std::fs::read(path).map_err(|e| NexusError::io(path, e))?;
-        bincode::deserialize(&bytes).map_err(NexusError::Deserialize)
+        let queue: CrawlQueue = bincode::deserialize(&bytes).map_err(|e| {
+            warn!("failed to deserialize queue from {}: {}", path.display(), e);
+            NexusError::Deserialize(e)
+        })?;
+        info!(
+            "loaded queue with {} entries from {}",
+            queue.len(),
+            path.display()
+        );
+        Ok(queue)
     }
 }
 
@@ -197,9 +231,24 @@ mod tests {
     #[test]
     fn higher_priority_popped_first() {
         let mut q = CrawlQueue::new(0);
-        q.push("https://a.com/discovered".into(), "a.com".into(), 2, priority::DISCOVERED);
-        q.push("https://a.com/seed".into(), "a.com".into(), 0, priority::SEED);
-        q.push("https://a.com/sitemap".into(), "a.com".into(), 1, priority::SITEMAP);
+        q.push(
+            "https://a.com/discovered".into(),
+            "a.com".into(),
+            2,
+            priority::DISCOVERED,
+        );
+        q.push(
+            "https://a.com/seed".into(),
+            "a.com".into(),
+            0,
+            priority::SEED,
+        );
+        q.push(
+            "https://a.com/sitemap".into(),
+            "a.com".into(),
+            1,
+            priority::SITEMAP,
+        );
 
         assert_eq!(q.pop_ready().unwrap().url, "https://a.com/seed");
         assert_eq!(q.pop_ready().unwrap().url, "https://a.com/sitemap");

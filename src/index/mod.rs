@@ -8,11 +8,12 @@ pub mod store;
 pub mod vocabulary;
 
 use crate::dedup::DuplicateIndex;
-use crate::document::{Document, DocId};
+use crate::document::{DocId, Document};
 use crate::index::inverted::InvertedIndex;
 use crate::index::store::DocumentStore;
 use crate::index::vocabulary::{TermId, Vocabulary};
 use crate::webdoc::WebMetaStore;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -78,6 +79,11 @@ impl Index {
 
         self.inverted.index_document(doc_id, &term_pairs);
         self.store.insert(doc_id, document.metadata);
+        debug!(
+            "indexed document {} -> {:?}",
+            doc_id,
+            self.store.get(doc_id).map(|m| &m.path)
+        );
         doc_id
     }
 
@@ -88,6 +94,7 @@ impl Index {
     /// single deletion. A `rebuild` compacts the vocabulary if desired.
     pub fn remove_document(&mut self, doc_id: DocId) -> bool {
         if let Some(meta) = self.store.remove(doc_id) {
+            debug!("removing document {} ({:?})", doc_id, meta.path);
             self.inverted.remove_document(doc_id, meta.token_count);
             self.web.remove(doc_id);
             self.duplicates.remove(doc_id);
@@ -101,6 +108,7 @@ impl Index {
     /// Returns `true` if a document was found and removed.
     pub fn remove_by_path(&mut self, path: &Path) -> bool {
         if let Some(id) = self.store.id_for_path(path) {
+            debug!("removing by path {:?} (doc_id {})", path, id);
             self.remove_document(id)
         } else {
             false

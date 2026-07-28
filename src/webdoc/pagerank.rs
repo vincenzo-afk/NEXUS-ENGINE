@@ -9,6 +9,7 @@
 
 use super::WebMetaStore;
 use crate::document::DocId;
+use log::{debug, info};
 use std::collections::HashMap;
 
 /// Standard PageRank damping factor (the probability of following a link
@@ -34,7 +35,8 @@ pub fn compute(store: &WebMetaStore, damping: f32) -> HashMap<DocId, f32> {
 
     let mut scores: HashMap<DocId, f32> = ids.iter().map(|&id| (id, 1.0 / n_f)).collect();
 
-    for _ in 0..MAX_ITERATIONS {
+    for iteration in 0..MAX_ITERATIONS {
+        info!("PageRank iteration {}/{}", iteration + 1, MAX_ITERATIONS);
         let dangling_mass: f32 = ids
             .iter()
             .filter(|&&id| store.get(id).map(|m| m.out_degree()).unwrap_or(0) == 0)
@@ -79,8 +81,14 @@ pub fn compute(store: &WebMetaStore, damping: f32) -> HashMap<DocId, f32> {
 
         scores = next;
         if max_delta < CONVERGENCE_EPSILON {
+            debug!(
+                "PageRank converged after {} iterations (max_delta={})",
+                iteration + 1,
+                max_delta
+            );
             break;
         }
+        debug!("iteration {} max_delta={}", iteration + 1, max_delta);
     }
 
     scores
@@ -90,7 +98,13 @@ pub fn compute(store: &WebMetaStore, damping: f32) -> HashMap<DocId, f32> {
 /// [`super::WebPageMeta::pagerank`] field so it can be persisted and used
 /// directly by the ranking stage without recomputing on every search.
 pub fn compute_and_store(store: &mut WebMetaStore, damping: f32) {
+    info!(
+        "computing PageRank for {} pages (damping={})",
+        store.len(),
+        damping
+    );
     let scores = compute(store, damping);
+    info!("PageRank computed, storing {} scores", scores.len());
     for (doc_id, score) in scores {
         if let Some(meta) = store.get_mut(doc_id) {
             meta.pagerank = score;
@@ -115,6 +129,7 @@ mod tests {
             fetched_unix: 0,
             etag: None,
             last_modified: None,
+            redirect_chain: Vec::new(),
             simhash: 0,
             depth: 0,
             outgoing: Vec::new(),
@@ -129,9 +144,15 @@ mod tests {
     fn heavily_linked_page_scores_higher() {
         let mut store = WebMetaStore::new();
         let mut a = page("https://example.com/a");
-        a.outgoing.push(LinkEdge { doc_id: 1, anchor_text: "b".into() });
+        a.outgoing.push(LinkEdge {
+            doc_id: 1,
+            anchor_text: "b".into(),
+        });
         let mut c = page("https://example.com/c");
-        c.outgoing.push(LinkEdge { doc_id: 1, anchor_text: "b".into() });
+        c.outgoing.push(LinkEdge {
+            doc_id: 1,
+            anchor_text: "b".into(),
+        });
         let b = page("https://example.com/b");
 
         store.insert(0, a);
@@ -147,9 +168,15 @@ mod tests {
     fn scores_sum_close_to_one() {
         let mut store = WebMetaStore::new();
         let mut a = page("https://example.com/a");
-        a.outgoing.push(LinkEdge { doc_id: 1, anchor_text: "b".into() });
+        a.outgoing.push(LinkEdge {
+            doc_id: 1,
+            anchor_text: "b".into(),
+        });
         let mut b = page("https://example.com/b");
-        b.outgoing.push(LinkEdge { doc_id: 0, anchor_text: "a".into() });
+        b.outgoing.push(LinkEdge {
+            doc_id: 0,
+            anchor_text: "a".into(),
+        });
         store.insert(0, a);
         store.insert(1, b);
 

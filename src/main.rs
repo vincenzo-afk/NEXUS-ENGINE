@@ -12,7 +12,9 @@
 //! the appropriate command handler in [`cli::commands`].
 
 mod api;
+mod bangs;
 mod autocomplete;
+mod browser;
 mod cli;
 mod clicks;
 mod config;
@@ -23,6 +25,8 @@ mod formats;
 mod fs;
 mod html;
 mod index;
+mod network;
+mod privacy;
 mod query;
 mod ranking;
 mod search;
@@ -36,25 +40,37 @@ mod webdoc;
 
 use clap::Parser;
 use cli::Cli;
+use log::{debug, error, info};
 
 fn main() {
     let cli = Cli::parse();
     configure_logging(cli.verbose, cli.debug);
+
+    info!("Nexus search engine starting");
+    debug!(
+        "CLI configuration: verbose={}, debug={}, config={:?}",
+        cli.verbose, cli.debug, cli.config
+    );
 
     let config_path = cli
         .config
         .clone()
         .unwrap_or_else(config::default_config_path);
 
+    debug!("using config path: {}", config_path.display());
+
     if let Err(err) = cli::commands::run(cli.command, &config_path) {
+        error!("command failed: {}", err);
         eprintln!("error: {}", err);
         std::process::exit(1);
     }
+
+    info!("Nexus finished successfully");
 }
 
-/// Sets the verbosity used by the (very small) internal logger. Nexus
-/// keeps logging intentionally lightweight: `--verbose` prints progress
-/// information, `--debug` additionally enables internal diagnostics.
+/// Initializes the `env_logger` with the appropriate log level based on
+/// CLI flags. `--debug` enables debug-level logs, `--verbose` enables
+/// info-level, and the default is `warn` (only warnings and errors).
 fn configure_logging(verbose: bool, debug: bool) {
     let level = if debug {
         "debug"
@@ -63,5 +79,12 @@ fn configure_logging(verbose: bool, debug: bool) {
     } else {
         "warn"
     };
-    std::env::set_var("NEXUS_LOG", level);
+
+    std::env::set_var("RUST_LOG", level);
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+        .format_timestamp_millis()
+        .init();
+
+    debug!("logging initialized at level: {}", level);
 }

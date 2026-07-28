@@ -12,6 +12,8 @@
 //! terms, which in practice lands on the sentence that best represents why
 //! the document matched.
 
+use log::debug;
+
 use crate::error::{NexusError, Result};
 use crate::text;
 use std::collections::HashSet;
@@ -46,6 +48,12 @@ pub fn generate_from_content(content: &str, terms: &HashSet<String>) -> Snippet 
     let tokens = text::tokenize(&normalized);
 
     let matches: Vec<&text::Token> = tokens.iter().filter(|t| terms.contains(&t.text)).collect();
+
+    debug!(
+        "generating snippet: {} query terms, {} matches in content",
+        terms.len(),
+        matches.len()
+    );
 
     if matches.is_empty() {
         let preview: String = normalized.chars().take(CONTEXT_CHARS * 2).collect();

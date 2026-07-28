@@ -8,6 +8,7 @@
 //! their anchor text — everything the rest of Nexus needs and nothing it
 //! doesn't.
 
+use log::{debug, info};
 use scraper::{Html, Selector};
 
 /// A single outbound hyperlink found in a page, before URL resolution.
@@ -43,6 +44,9 @@ pub struct ExtractedContent {
     pub canonical_url: Option<String>,
     /// `<html lang="...">` value, if declared.
     pub lang: Option<String>,
+    /// RSS/Atom feed URLs declared via
+    /// `<link rel="alternate" type="application/rss+xml">` (or `atom+xml`).
+    pub feed_urls: Vec<String>,
 }
 
 impl ExtractedContent {
@@ -50,7 +54,8 @@ impl ExtractedContent {
     /// paragraphs concatenated. This (not the raw HTML) is what gets
     /// tokenized and indexed.
     pub fn indexable_text(&self) -> String {
-        let mut parts: Vec<&str> = Vec::with_capacity(2 + self.headings.len() + self.paragraphs.len());
+        let mut parts: Vec<&str> =
+            Vec::with_capacity(2 + self.headings.len() + self.paragraphs.len());
         parts.push(self.title.as_str());
         parts.push(self.meta_description.as_str());
         for h in &self.headings {
@@ -78,13 +83,24 @@ const NOISE_TAGS: &[&str] = &[
 /// Class/ID substrings commonly used for ad slots, cookie banners, and
 /// other non-content chrome. A best-effort heuristic, not a guarantee.
 const NOISE_HINTS: &[&str] = &[
-    "advert", "advertisement", "ads-", "ad-slot", "sponsor", "cookie-banner", "cookie-consent",
-    "newsletter-signup", "site-nav", "breadcrumb", "social-share", "comment-section",
+    "advert",
+    "advertisement",
+    "ads-",
+    "ad-slot",
+    "sponsor",
+    "cookie-banner",
+    "cookie-consent",
+    "newsletter-signup",
+    "site-nav",
+    "breadcrumb",
+    "social-share",
+    "comment-section",
 ];
 
 /// Parses `html` and extracts title, headings, paragraphs, metadata, alt
 /// text, and links, discarding script/style/nav/ad chrome.
 pub fn extract(html: &str) -> ExtractedContent {
+    debug!("parsing HTML document ({} bytes)", html.len());
     let document = Html::parse_document(html);
     let mut result = ExtractedContent::default();
 
@@ -116,6 +132,17 @@ pub fn extract(html: &str) -> ExtractedContent {
     if let Ok(sel) = Selector::parse(r#"link[rel="canonical" i]"#) {
         if let Some(el) = document.select(&sel).next() {
             result.canonical_url = el.value().attr("href").map(|s| s.to_string());
+        }
+    }
+
+    if let Ok(sel) = Selector::parse(r#"link[rel="alternate" i]"#) {
+        for el in document.select(&sel) {
+            let feed_type = el.value().attr("type").unwrap_or("").to_lowercase();
+            if feed_type == "application/rss+xml" || feed_type == "application/atom+xml" {
+                if let Some(href) = el.value().attr("href") {
+                    result.feed_urls.push(href.to_string());
+                }
+            }
         }
     }
 
@@ -191,6 +218,12 @@ pub fn extract(html: &str) -> ExtractedContent {
     // fully avoided the overlap because the div had no other text).
     result.paragraphs.dedup();
 
+    info!(
+        "extracted: title='{}', paragraphs={}, links={}",
+        result.title,
+        result.paragraphs.len(),
+        result.links.len()
+    );
     result
 }
 
@@ -249,6 +282,9 @@ mod tests {
   <title>  Rust Ownership Explained  </title>
   <meta name="Description" content="A guide to Rust's ownership model.">
   <link rel="canonical" href="https://example.com/rust-ownership">
+  <link rel="alternate" type="application/rss+xml" href="/feed.xml">
+  <link rel="alternate" type="application/atom+xml" href="https://example.com/atom.xml">
+  <link rel="stylesheet" href="/style.css">
   <script>trackPageView();</script>
   <style>.ad { display:none; }</style>
 </head>
@@ -269,6 +305,15 @@ mod tests {
 "#;
 
     #[test]
+    fn discovers_rss_and_atom_feed_links_but_not_stylesheets() {
+        let content = extract(SAMPLE);
+        assert_eq!(content.feed_urls.len(), 2);
+        assert!(content.feed_urls.contains(&"/feed.xml".to_string()));
+        assert!(content.feed_urls.contains(&"https://example.com/atom.xml".to_string()));
+        assert!(!content.feed_urls.iter().any(|u| u.contains("style.css")));
+    }
+
+    #[test]
     fn extracts_title_and_meta() {
         let content = extract(SAMPLE);
         assert_eq!(content.title, "Rust Ownership Explained");
@@ -286,7 +331,9 @@ mod tests {
     #[test]
     fn extracts_headings_and_paragraphs() {
         let content = extract(SAMPLE);
-        assert!(content.headings.contains(&"Rust Ownership Explained".to_string()));
+        assert!(content
+            .headings
+            .contains(&"Rust Ownership Explained".to_string()));
         assert!(content.headings.contains(&"Borrowing".to_string()));
         assert!(content
             .paragraphs

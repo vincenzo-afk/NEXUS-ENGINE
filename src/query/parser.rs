@@ -14,9 +14,11 @@ use crate::error::{NexusError, Result};
 use crate::query::ast::{CompareOp, QueryNode};
 use crate::query::lexer::{lex, QueryToken};
 use crate::text;
+use log::debug;
 
 /// Parses a raw query string into a [`QueryNode`] tree.
 pub fn parse(input: &str) -> Result<QueryNode> {
+    debug!("parsing query: '{}'", input);
     let tokens = lex(input);
     if tokens.is_empty() {
         return Err(NexusError::QueryParse("empty query".to_string()));
@@ -135,7 +137,9 @@ fn word_to_node(word: &str) -> QueryNode {
 
 fn build_filter(key: &str, value: &str) -> Result<QueryNode> {
     match key.to_lowercase().as_str() {
-        "ext" | "filetype" => Ok(QueryNode::FilterExt(value.trim_start_matches('.').to_lowercase())),
+        "ext" | "filetype" => Ok(QueryNode::FilterExt(
+            value.trim_start_matches('.').to_lowercase(),
+        )),
         "path" | "inurl" => Ok(QueryNode::FilterPath(text::normalize(value))),
         "name" | "intitle" => Ok(QueryNode::FilterName(text::normalize(value))),
         "site" => Ok(QueryNode::FilterSite(
@@ -143,8 +147,14 @@ fn build_filter(key: &str, value: &str) -> Result<QueryNode> {
         )),
         "lang" => Ok(QueryNode::FilterLang(value.to_lowercase())),
         "author" => Ok(QueryNode::FilterAuthor(text::normalize(value))),
-        "before" => Ok(QueryNode::FilterDate(CompareOp::LessThan, parse_date(value)?)),
-        "after" => Ok(QueryNode::FilterDate(CompareOp::GreaterThan, parse_date(value)?)),
+        "before" => Ok(QueryNode::FilterDate(
+            CompareOp::LessThan,
+            parse_date(value)?,
+        )),
+        "after" => Ok(QueryNode::FilterDate(
+            CompareOp::GreaterThan,
+            parse_date(value)?,
+        )),
         other => Err(NexusError::QueryParse(format!("unknown filter: {}", other))),
     }
 }
@@ -175,7 +185,12 @@ fn build_compare_filter(key: &str, op: char, value: &str) -> Result<QueryNode> {
     let compare_op = match op {
         '>' => CompareOp::GreaterThan,
         '<' => CompareOp::LessThan,
-        _ => return Err(NexusError::QueryParse(format!("unsupported operator: {}", op))),
+        _ => {
+            return Err(NexusError::QueryParse(format!(
+                "unsupported operator: {}",
+                op
+            )))
+        }
     };
 
     match key.to_lowercase().as_str() {
@@ -339,10 +354,7 @@ mod tests {
     #[test]
     fn parses_prefix_and_wildcard() {
         assert_eq!(parse("pars*").unwrap(), QueryNode::Prefix("pars".into()));
-        assert_eq!(
-            parse("wor?d").unwrap(),
-            QueryNode::Wildcard("wor?d".into())
-        );
+        assert_eq!(parse("wor?d").unwrap(), QueryNode::Wildcard("wor?d".into()));
     }
 
     #[test]
@@ -371,7 +383,10 @@ mod tests {
 
     #[test]
     fn parses_lang_and_author() {
-        assert_eq!(parse("lang:en").unwrap(), QueryNode::FilterLang("en".into()));
+        assert_eq!(
+            parse("lang:en").unwrap(),
+            QueryNode::FilterLang("en".into())
+        );
         assert_eq!(
             parse("author:jane").unwrap(),
             QueryNode::FilterAuthor("jane".into())
@@ -389,6 +404,9 @@ mod tests {
         }
 
         let node = parse("after:2022").unwrap();
-        assert!(matches!(node, QueryNode::FilterDate(CompareOp::GreaterThan, _)));
+        assert!(matches!(
+            node,
+            QueryNode::FilterDate(CompareOp::GreaterThan, _)
+        ));
     }
 }

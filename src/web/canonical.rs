@@ -5,6 +5,7 @@
 //! `http://Example.com/a`, `https://example.com/a/`, and
 //! `https://example.com/a?utm_source=x#top` as three different pages.
 
+use log::debug;
 use url::Url;
 
 /// Common tracking / session query parameters that carry no bearing on the
@@ -79,6 +80,12 @@ pub fn canonicalize(url: &Url) -> Url {
         u.set_path(path.trim_end_matches('/'));
     }
 
+    let original = url.as_str();
+    let canonical = u.as_str();
+    if original != canonical {
+        debug!("canonicalized '{}' -> '{}'", original, canonical);
+    }
+
     u
 }
 
@@ -114,9 +121,12 @@ pub fn resolve(base: &Url, href: &str) -> Option<Url> {
 /// Returns the registrable "domain" used for per-domain rate limiting and
 /// domain-quality scoring: the host, without a leading `www.`.
 pub fn domain_of(url: &Url) -> String {
-    url.host_str()
+    let domain = url
+        .host_str()
         .map(|h| h.strip_prefix("www.").unwrap_or(h).to_lowercase())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    debug!("domain_of '{}' -> '{}'", url.as_str(), domain);
+    domain
 }
 
 #[cfg(test)]

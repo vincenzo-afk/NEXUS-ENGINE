@@ -1,0 +1,21 @@
+/target
+Cargo.lock.bak
+
+# Machine-local cargo overrides (e.g. a custom target-dir) must never be
+# committed — a prior commit shipped a Windows-only `target-dir =
+# "E:/rust/target"` override here, which broke the build for anyone not on
+# that exact machine. If you need a local override, keep it out of git.
+/.cargo/config.toml
+/.cargo/config
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local data directories a running instance may create if pointed here
+/data/
+*.nxi
+*.nxc
+*.nxq

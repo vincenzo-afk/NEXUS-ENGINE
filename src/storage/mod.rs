@@ -11,6 +11,7 @@ pub mod content_cache;
 
 use crate::error::{NexusError, Result};
 use crate::index::{Index, INDEX_FORMAT_VERSION};
+use log::{debug, info, warn};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -21,28 +22,33 @@ const MAGIC: [u8; 4] = [0x4E, 0x58, 0x49, 0x00];
 /// as needed. Writes to a temporary file first and renames it into place so
 /// a crash mid-write cannot corrupt a previously-good index.
 pub fn save(index: &Index, path: &Path) -> Result<()> {
+    info!("saving index to {}", path.display());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
     }
 
     let payload = bincode::serialize(index).map_err(NexusError::Serialize)?;
     let checksum = crc32fast::hash(&payload);
+    debug!("payload checksum: {:#010x}", checksum);
 
     let tmp_path = path.with_extension("nxi.tmp");
     {
         let mut file =
             std::fs::File::create(&tmp_path).map_err(|e| NexusError::io(&tmp_path, e))?;
-        file.write_all(&MAGIC).map_err(|e| NexusError::io(&tmp_path, e))?;
+        file.write_all(&MAGIC)
+            .map_err(|e| NexusError::io(&tmp_path, e))?;
         file.write_all(&INDEX_FORMAT_VERSION.to_le_bytes())
             .map_err(|e| NexusError::io(&tmp_path, e))?;
         file.write_all(&checksum.to_le_bytes())
             .map_err(|e| NexusError::io(&tmp_path, e))?;
         file.write_all(&(payload.len() as u64).to_le_bytes())
             .map_err(|e| NexusError::io(&tmp_path, e))?;
-        file.write_all(&payload).map_err(|e| NexusError::io(&tmp_path, e))?;
+        file.write_all(&payload)
+            .map_err(|e| NexusError::io(&tmp_path, e))?;
         file.sync_all().map_err(|e| NexusError::io(&tmp_path, e))?;
     }
     std::fs::rename(&tmp_path, path).map_err(|e| NexusError::io(path, e))?;
+    info!("index saved to {}", path.display());
     Ok(())
 }
 
@@ -50,6 +56,7 @@ pub fn save(index: &Index, path: &Path) -> Result<()> {
 /// [`NexusError::CorruptIndex`] if the magic number, version, checksum, or
 /// declared length do not match what is actually on disk.
 pub fn load(path: &Path) -> Result<Index> {
+    info!("loading index from {}", path.display());
     let mut file = std::fs::File::open(path).map_err(|e| NexusError::io(path, e))?;
 
     let mut magic = [0u8; 4];
@@ -76,6 +83,7 @@ pub fn load(path: &Path) -> Result<Index> {
     file.read_exact(&mut checksum_bytes)
         .map_err(|e| NexusError::io(path, e))?;
     let expected_checksum = u32::from_le_bytes(checksum_bytes);
+    debug!("expected checksum: {:#010x}", expected_checksum);
 
     let mut len_bytes = [0u8; 8];
     file.read_exact(&mut len_bytes)
@@ -83,10 +91,12 @@ pub fn load(path: &Path) -> Result<Index> {
     let payload_len = u64::from_le_bytes(len_bytes) as usize;
 
     let mut payload = vec![0u8; payload_len];
-    file.read_exact(&mut payload)
-        .map_err(|_| NexusError::CorruptIndex("payload shorter than declared length".to_string()))?;
+    file.read_exact(&mut payload).map_err(|_| {
+        NexusError::CorruptIndex("payload shorter than declared length".to_string())
+    })?;
 
     let actual_checksum = crc32fast::hash(&payload);
+    debug!("actual checksum: {:#010x}", actual_checksum);
     if actual_checksum != expected_checksum {
         return Err(NexusError::CorruptIndex(format!(
             "checksum mismatch: expected {:#010x}, got {:#010x}",
@@ -99,7 +109,11 @@ pub fn load(path: &Path) -> Result<Index> {
 
 /// Returns `true` if an index file already exists at `path`.
 pub fn exists(path: &Path) -> bool {
-    path.exists()
+    let exists = path.exists();
+    if !exists {
+        warn!("index file does not exist: {}", path.display());
+    }
+    exists
 }
 
 #[cfg(test)]

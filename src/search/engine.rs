@@ -2,6 +2,8 @@
 //! matching documents, each annotated with the per-term match information
 //! the ranking stage needs.
 
+use log::{debug, info};
+
 use crate::document::DocId;
 use crate::index::Index;
 use crate::query::{CompareOp, QueryNode};
@@ -30,10 +32,6 @@ pub struct SearchResult {
     pub explanation: ScoreExplanation,
 }
 
-/// Executes `query` against `index`, returning the top `limit` results
-/// starting at `offset` (for pagination), ordered by descending score.
-/// `clicks` supplies the click-history ranking signal; pass `None` if no
-/// click log is being tracked.
 pub fn search(
     index: &Index,
     query: &QueryNode,
@@ -41,8 +39,10 @@ pub fn search(
     offset: usize,
     limit: usize,
     clicks: Option<&crate::clicks::ClickLog>,
-) -> Vec<SearchResult> {
+) -> (Vec<SearchResult>, usize) {
+    info!("search query: {:?}", query);
     let matches = evaluate(query, index);
+    let total_matches = matches.len();
     let now_unix = chrono::Utc::now().timestamp();
 
     let mut results: Vec<SearchResult> = matches
@@ -81,8 +81,14 @@ pub fn search(
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.into_iter().skip(offset).take(limit).collect()
+    debug!("search returned {} raw results", results.len());
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let paginated = results.into_iter().skip(offset).take(limit).collect();
+    (paginated, total_matches)
 }
 
 /// Recursively evaluates a query node against the index, returning the
@@ -92,27 +98,26 @@ fn evaluate(node: &QueryNode, index: &Index) -> HashMap<DocId, MatchInfo> {
         QueryNode::Term(term) => match_term(term, index),
         QueryNode::Phrase(terms) => match_phrase(terms, index),
         QueryNode::Prefix(prefix) => match_predicate(index, |t| t.starts_with(prefix.as_str())),
-        QueryNode::Wildcard(pattern) => {
-            match_predicate(index, |t| wildcard_matches(pattern, t))
-        }
+        QueryNode::Wildcard(pattern) => match_predicate(index, |t| wildcard_matches(pattern, t)),
         QueryNode::Fuzzy { term, max_distance } => {
             match_predicate(index, |t| levenshtein_distance(term, t) <= *max_distance)
         }
         QueryNode::And(children) => evaluate_and(children, index),
         QueryNode::Or(children) => evaluate_or(children, index),
         QueryNode::Not(inner) => evaluate_not(inner, index),
-        QueryNode::FilterExt(ext) => {
-            filter_docs(index, |meta| &meta.extension == ext)
-        }
+        QueryNode::FilterExt(ext) => filter_docs(index, |meta| &meta.extension == ext),
         QueryNode::FilterPath(substring) => filter_docs(index, |meta| {
-            meta.path.to_string_lossy().to_lowercase().contains(substring.as_str())
+            meta.path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(substring.as_str())
         }),
         QueryNode::FilterName(substring) => filter_docs(index, |meta| {
             meta.file_name.to_lowercase().contains(substring.as_str())
         }),
-        QueryNode::FilterSize(op, threshold) => filter_docs(index, |meta| {
-            compare(meta.size_bytes, *op, *threshold)
-        }),
+        QueryNode::FilterSize(op, threshold) => {
+            filter_docs(index, |meta| compare(meta.size_bytes, *op, *threshold))
+        }
         QueryNode::FilterModified(op, threshold_seconds) => {
             let now = chrono::Utc::now().timestamp();
             filter_docs(index, |meta| {
@@ -132,12 +137,10 @@ fn evaluate(node: &QueryNode, index: &Index) -> HashMap<DocId, MatchInfo> {
         QueryNode::FilterSite(domain) => filter_web_docs(index, |meta| {
             meta.domain == *domain || meta.domain.ends_with(&format!(".{domain}"))
         }),
-        QueryNode::FilterDate(op, threshold_unix) => filter_docs(index, |meta| {
-            match op {
-                CompareOp::LessThan => meta.modified_unix < *threshold_unix,
-                CompareOp::GreaterThan => meta.modified_unix > *threshold_unix,
-                CompareOp::Equal => meta.modified_unix == *threshold_unix,
-            }
+        QueryNode::FilterDate(op, threshold_unix) => filter_docs(index, |meta| match op {
+            CompareOp::LessThan => meta.modified_unix < *threshold_unix,
+            CompareOp::GreaterThan => meta.modified_unix > *threshold_unix,
+            CompareOp::Equal => meta.modified_unix == *threshold_unix,
         }),
         QueryNode::FilterLang(lang) => {
             filter_web_docs(index, |meta| meta.lang.as_deref() == Some(lang.as_str()))
@@ -191,7 +194,9 @@ fn match_term(term: &str, index: &Index) -> HashMap<DocId, MatchInfo> {
     if let Some(term_id) = index.vocabulary.get(term) {
         if let Some(list) = index.inverted.postings_for(term_id) {
             for posting in &list.postings {
-                let entry = results.entry(posting.doc_id).or_insert_with(MatchInfo::default);
+                let entry = results
+                    .entry(posting.doc_id)
+                    .or_insert_with(MatchInfo::default);
                 entry
                     .term_frequencies
                     .insert(term.to_string(), posting.term_frequency);
@@ -204,10 +209,7 @@ fn match_term(term: &str, index: &Index) -> HashMap<DocId, MatchInfo> {
 /// Matches every vocabulary term satisfying `predicate`, unioning their
 /// postings into a single match-info map. Used for prefix, wildcard, and
 /// fuzzy queries, all of which expand to a set of concrete terms.
-fn match_predicate(
-    index: &Index,
-    predicate: impl Fn(&str) -> bool,
-) -> HashMap<DocId, MatchInfo> {
+fn match_predicate(index: &Index, predicate: impl Fn(&str) -> bool) -> HashMap<DocId, MatchInfo> {
     let mut results: HashMap<DocId, MatchInfo> = HashMap::new();
     for (term, term_id) in index.vocabulary.iter() {
         if !predicate(term) {
@@ -215,7 +217,9 @@ fn match_predicate(
         }
         if let Some(list) = index.inverted.postings_for(term_id) {
             for posting in &list.postings {
-                let entry = results.entry(posting.doc_id).or_insert_with(MatchInfo::default);
+                let entry = results
+                    .entry(posting.doc_id)
+                    .or_insert_with(MatchInfo::default);
                 entry
                     .term_frequencies
                     .entry(term.to_string())
@@ -239,7 +243,12 @@ fn match_phrase(terms: &[String], index: &Index) -> HashMap<DocId, MatchInfo> {
 
     let posting_lists: Option<Vec<&crate::index::posting::PostingList>> = terms
         .iter()
-        .map(|t| index.vocabulary.get(t).and_then(|id| index.inverted.postings_for(id)))
+        .map(|t| {
+            index
+                .vocabulary
+                .get(t)
+                .and_then(|id| index.inverted.postings_for(id))
+        })
         .collect();
 
     let posting_lists = match posting_lists {
@@ -399,7 +408,9 @@ fn wildcard_recursive(pattern: &[char], text: &[char]) -> bool {
                 || (!text.is_empty() && wildcard_recursive(pattern, &text[1..]))
         }
         Some('?') => !text.is_empty() && wildcard_recursive(&pattern[1..], &text[1..]),
-        Some(c) => !text.is_empty() && *c == text[0] && wildcard_recursive(&pattern[1..], &text[1..]),
+        Some(c) => {
+            !text.is_empty() && *c == text[0] && wildcard_recursive(&pattern[1..], &text[1..])
+        }
     }
 }
 

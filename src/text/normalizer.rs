@@ -5,12 +5,15 @@
 //! ligatures) into a canonical form, which keeps the vocabulary compact and
 //! ensures that visually-identical strings hash to the same term.
 
+use log::trace;
 use unicode_normalization::UnicodeNormalization;
 
 /// Normalizes a string for indexing or querying: NFKC normalization
 /// followed by lowercasing.
 pub fn normalize(input: &str) -> String {
-    input.nfkc().collect::<String>().to_lowercase()
+    let result = input.nfkc().collect::<String>().to_lowercase();
+    trace!("normalized: '{}' -> '{}'", input, result);
+    result
 }
 
 #[cfg(test)]

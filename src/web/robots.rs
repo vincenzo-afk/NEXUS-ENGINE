@@ -5,6 +5,7 @@
 //! go to Allow" precedence, and falls back to the wildcard (`*`) group
 //! when no rule group matches our user agent by name.
 
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 /// One `Allow`/`Disallow` rule within a user-agent group.
@@ -41,6 +42,7 @@ impl RobotsTxt {
 
     /// Parses raw robots.txt text.
     pub fn parse(body: &str) -> RobotsTxt {
+        debug!("parsing robots.txt ({} bytes)", body.len());
         let mut groups: Vec<Group> = Vec::new();
         let mut sitemaps = Vec::new();
         let mut current: Option<Group> = None;
@@ -105,6 +107,9 @@ impl RobotsTxt {
                     group_started = true;
                     if let Some(g) = current.as_mut() {
                         g.crawl_delay = value.parse::<f32>().ok();
+                        if g.crawl_delay.is_none() {
+                            warn!("failed to parse Crawl-delay value: '{}'", value);
+                        }
                     }
                 }
                 "sitemap" => {
@@ -125,11 +130,16 @@ impl RobotsTxt {
     /// wildcard `*` group, otherwise `None`.
     fn group_for(&self, user_agent: &str) -> Option<&Group> {
         let agent_lower = user_agent.to_lowercase();
-        let named = self
-            .groups
-            .iter()
-            .find(|g| g.agents.iter().any(|a| a != "*" && agent_lower.contains(a.as_str())));
-        named.or_else(|| self.groups.iter().find(|g| g.agents.iter().any(|a| a == "*")))
+        let named = self.groups.iter().find(|g| {
+            g.agents
+                .iter()
+                .any(|a| a != "*" && agent_lower.contains(a.as_str()))
+        });
+        named.or_else(|| {
+            self.groups
+                .iter()
+                .find(|g| g.agents.iter().any(|a| a == "*"))
+        })
     }
 
     /// Returns `true` if `path` (the request-target: path + optional
@@ -140,6 +150,10 @@ impl RobotsTxt {
     /// `Allow` wins (the more permissive, standards-recommended tie-break).
     pub fn is_allowed(&self, user_agent: &str, path: &str) -> bool {
         let Some(group) = self.group_for(user_agent) else {
+            debug!(
+                "robots.txt: no matching group for '{}', allowing '{}'",
+                user_agent, path
+            );
             return true;
         };
 
@@ -156,7 +170,14 @@ impl RobotsTxt {
                 }
             }
         }
-        best.map(|r| r.allow).unwrap_or(true)
+        let allowed = best.map(|r| r.allow).unwrap_or(true);
+        debug!(
+            "robots.txt: {} for '{}' on '{}'",
+            if allowed { "ALLOW" } else { "DISALLOW" },
+            user_agent,
+            path
+        );
+        allowed
     }
 
     /// The crawl-delay (in seconds) requested for `user_agent`, if any.

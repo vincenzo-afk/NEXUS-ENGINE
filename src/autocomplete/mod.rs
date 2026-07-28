@@ -6,6 +6,7 @@ mod trie;
 
 use crate::error::{NexusError, Result};
 use crate::index::vocabulary::Vocabulary;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -78,6 +79,10 @@ impl Autocomplete {
     /// vocabulary. Terms are weighted by how many documents contain them
     /// (a cheap proxy for how "common" / useful a completion is).
     pub fn build(vocabulary: &Vocabulary, document_frequencies: &HashMap<String, u32>) -> Self {
+        debug!(
+            "building autocomplete trie from {} vocabulary terms",
+            vocabulary.len()
+        );
         let mut trie = Trie::new();
         for (term, _) in vocabulary.iter() {
             let weight = document_frequencies.get(term).copied().unwrap_or(1);
@@ -90,7 +95,14 @@ impl Autocomplete {
 
     /// Returns up to `limit` vocabulary terms starting with `prefix`.
     pub fn suggest(&self, prefix: &str, limit: usize) -> Vec<String> {
+        debug!("autocomplete suggest: prefix='{}', limit={}", prefix, limit);
         let normalized = crate::text::normalize(prefix);
-        self.trie.suggest(&normalized, limit)
+        let results = self.trie.suggest(&normalized, limit);
+        debug!(
+            "autocomplete: {} suggestions for '{}'",
+            results.len(),
+            prefix
+        );
+        results
     }
 }

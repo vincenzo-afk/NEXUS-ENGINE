@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nexus Search</title>
+  <meta name="description" content="Nexus - a privacy-respecting search engine">
+  <link rel="search" type="application/opensearchdescription+xml" title="Nexus" href="/opensearch.xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a href="#search-input" class="skip-link">Skip to search</a>
+
+  <header class="top-bar" role="banner">
+    <div class="top-bar-inner">
+      <a href="/" class="logo" aria-label="Nexus Search Home">
+        <span class="logo-icon" aria-hidden="true">&#x26A1;</span>
+        <span class="logo-text">Nexus</span>
+      </a>
+      <nav class="top-nav" aria-label="Main navigation">
+        <button id="history-toggle" class="btn btn-ghost" aria-label="Search history" aria-expanded="false" aria-controls="history-panel">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+          <span class="btn-label">History</span>
+        </button>
+        <button id="saved-toggle" class="btn btn-ghost" aria-label="Saved searches" aria-expanded="false" aria-controls="saved-panel">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          <span class="btn-label">Saved</span>
+        </button>
+        <button id="filter-toggle" class="btn btn-ghost" aria-label="Toggle filters" aria-expanded="false" aria-controls="filter-panel">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="12" y1="18" x2="20" y2="18"/></svg>
+          <span class="btn-label">Filters</span>
+        </button>
+        <button id="theme-toggle" class="btn btn-ghost" aria-label="Toggle dark mode" title="Toggle dark mode (Ctrl+Shift+D)">
+          <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+      </nav>
+
+      <div id="history-panel" class="dropdown-panel" role="region" aria-label="Search history" hidden>
+        <div class="dropdown-panel-header">
+          <span>Recent searches</span>
+          <button id="history-clear" class="btn btn-ghost btn-sm">Clear all</button>
+        </div>
+        <ul id="history-list" class="dropdown-list"></ul>
+        <p id="history-empty" class="dropdown-empty" hidden>No searches yet.</p>
+      </div>
+
+      <div id="saved-panel" class="dropdown-panel" role="region" aria-label="Saved searches" hidden>
+        <div class="dropdown-panel-header">
+          <span>Saved searches</span>
+          <button id="saved-add" class="btn btn-ghost btn-sm" title="Save the current search">+ Save current</button>
+        </div>
+        <ul id="saved-list" class="dropdown-list"></ul>
+        <p id="saved-empty" class="dropdown-empty" hidden>No saved searches yet. Run a search, then click "Save current".</p>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" role="main">
+    <section class="hero" aria-label="Search">
+      <div class="hero-content">
+        <h1 class="hero-title">
+          <span class="hero-logo" aria-hidden="true">&#x26A1;</span>
+          Nexus
+        </h1>
+        <p class="hero-subtitle">Privacy-respecting search</p>
+
+        <div class="search-container" role="search">
+          <div class="search-box-wrapper">
+            <div class="search-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            </div>
+            <input
+              id="search-input"
+              class="search-input"
+              type="search"
+              placeholder="Search Nexus..."
+              autocomplete="off"
+              spellcheck="false"
+              autocapitalize="off"
+              autocorrect="off"
+              aria-label="Search query"
+              aria-autocomplete="list"
+              aria-controls="autocomplete-list"
+              aria-activedescendant=""
+              role="combobox"
+              aria-expanded="false"
+            >
+            <button id="search-clear" class="search-clear" aria-label="Clear search" tabindex="-1" hidden>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+          <ul id="autocomplete-list" class="autocomplete-list" role="listbox" aria-label="Search suggestions" hidden></ul>
+        </div>
+
+        <div id="filter-panel" class="filter-panel" role="region" aria-label="Search filters" hidden>
+          <div class="filter-group">
+            <label for="filter-filetype" class="filter-label">File type</label>
+            <select id="filter-filetype" class="filter-select">
+              <option value="">Any</option>
+              <option value="pdf">PDF</option>
+              <option value="html">HTML</option>
+              <option value="txt">Text</option>
+              <option value="doc">Word</option>
+              <option value="ppt">PowerPoint</option>
+              <option value="xls">Excel</option>
+              <option value="img">Images</option>
+              <option value="video">Video</option>
+              <option value="audio">Audio</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="filter-site" class="filter-label">Site</label>
+            <input type="text" id="filter-site" class="filter-input" placeholder="example.com" aria-label="Filter by site">
+          </div>
+          <div class="filter-group">
+            <label for="filter-date" class="filter-label">Time</label>
+            <select id="filter-date" class="filter-select">
+              <option value="">Any time</option>
+              <option value="h">Past hour</option>
+              <option value="d">Past day</option>
+              <option value="w">Past week</option>
+              <option value="m">Past month</option>
+              <option value="y">Past year</option>
+            </select>
+          </div>
+          <div class="filter-actions">
+            <button id="filter-apply" class="btn btn-primary btn-sm">Apply</button>
+            <button id="filter-reset" class="btn btn-ghost btn-sm">Reset</button>
+          </div>
+        </div>
+
+        <div class="search-hints" aria-hidden="true">
+          <span class="hint"><kbd>/</kbd> Focus search</span>
+          <span class="hint"><kbd>Esc</kbd> Clear</span>
+          <span class="hint"><kbd>&uarr;</kbd><kbd>&darr;</kbd> Navigate</span>
+          <span class="hint"><kbd>Enter</kbd> Open</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="results-section" class="results-section" aria-label="Search results" hidden>
+      <div class="results-header">
+        <div class="results-stats" id="results-stats" aria-live="polite"></div>
+        <div class="results-view-options">
+          <button id="export-json-btn" class="btn btn-ghost btn-sm" hidden>Export JSON</button>
+          <button id="export-csv-btn" class="btn btn-ghost btn-sm" hidden>Export CSV</button>
+          <button id="load-all-btn" class="btn btn-ghost btn-sm" hidden>Load all at once</button>
+        </div>
+      </div>
+
+      <div id="results-list" class="results-list" role="list" aria-label="Search results">
+        <div id="results-placeholder" class="results-placeholder" aria-hidden="true">
+          <div class="spinner" role="status">
+            <span class="sr-only">Loading results...</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="pagination" class="pagination" role="navigation" aria-label="Pagination" hidden>
+        <button id="prev-page" class="btn btn-outline" aria-label="Previous page" disabled>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+          Previous
+        </button>
+        <span id="page-info" class="page-info" aria-live="polite"></span>
+        <button id="next-page" class="btn btn-outline" aria-label="Next page">
+          Next
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+      </div>
+
+      <div id="more-section" class="more-section" hidden>
+        <button id="show-more-btn" class="btn btn-outline btn-more">Show more results</button>
+      </div>
+    </section>
+
+    <section id="error-section" class="error-section" aria-label="Error" hidden>
+      <div class="error-content">
+        <div class="error-icon" aria-hidden="true">&#x26A0;</div>
+        <h2 class="error-title">Something went wrong</h2>
+        <p id="error-message" class="error-message"></p>
+        <button id="retry-btn" class="btn btn-primary">Try again</button>
+      </div>
+    </section>
+
+    <section id="empty-section" class="empty-section" aria-label="No results" hidden>
+      <div class="empty-content">
+        <div class="empty-icon" aria-hidden="true">&#x1F50D;</div>
+        <h2 class="empty-title">No results found</h2>
+        <p id="empty-message" class="empty-message">Try different keywords or remove filters.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer" role="contentinfo">
+    <div class="footer-inner">
+      <span class="footer-text">Nexus Search &mdash; no tracking, no ads, no bias.</span>
+      <span class="footer-hint">Press <kbd>/</kbd> to search</span>
+    </div>
+  </footer>
+
+  <div id="keyboard-shortcuts-help" class="shortcuts-help" role="dialog" aria-label="Keyboard shortcuts" hidden>
+    <div class="shortcuts-overlay" tabindex="-1"></div>
+    <div class="shortcuts-panel">
+      <h2 class="shortcuts-title">Keyboard shortcuts</h2>
+      <dl class="shortcuts-list">
+        <div class="shortcut-row"><dt><kbd>/</kbd></dt><dd>Focus the search box</dd></div>
+        <div class="shortcut-row"><dt><kbd>Esc</kbd></dt><dd>Clear search / close</dd></div>
+        <div class="shortcut-row"><dt><kbd>&uarr;</kbd> <kbd>&darr;</kbd></dt><dd>Navigate results</dd></div>
+        <div class="shortcut-row"><dt><kbd>Enter</kbd></dt><dd>Open selected result</dd></div>
+        <div class="shortcut-row"><dt><kbd>Ctrl</kbd> + <kbd>Enter</kbd></dt><dd>Open in new tab</dd></div>
+        <div class="shortcut-row"><dt><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></dt><dd>Toggle dark mode</dd></div>
+        <div class="shortcut-row"><dt><kbd>?</kbd></dt><dd>Show this help</dd></div>
+      </dl>
+      <button class="btn btn-primary shortcuts-close" autofocus>Got it</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

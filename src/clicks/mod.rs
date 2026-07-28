@@ -8,6 +8,7 @@
 
 use crate::document::DocId;
 use crate::error::{NexusError, Result};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,6 +22,7 @@ pub struct ClickLog {
 impl ClickLog {
     /// Loads the click log from `path`, or an empty log if none exists yet.
     pub fn load(path: &Path) -> Result<ClickLog> {
+        debug!("loading click log from: {}", path.display());
         if !path.exists() {
             return Ok(ClickLog::default());
         }
@@ -39,6 +41,7 @@ impl ClickLog {
 
     /// Records one click on `doc_id`.
     pub fn record(&mut self, doc_id: DocId) {
+        debug!("click recorded: doc_id={}", doc_id);
         *self.counts.entry(doc_id).or_insert(0) += 1;
     }
 

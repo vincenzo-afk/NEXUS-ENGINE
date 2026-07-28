@@ -1,6 +1,7 @@
 //! `sitemap.xml` parsing, including recursive `<sitemapindex>` files that
 //! point at other sitemaps rather than pages directly.
 
+use log::debug;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
@@ -21,15 +22,17 @@ pub struct ParsedSitemap {
 /// empty result rather than an error: a broken sitemap should not abort a
 /// crawl, since the crawler can still discover pages via links.
 pub fn parse(xml: &str) -> ParsedSitemap {
+    debug!("parsing sitemap ({} bytes)", xml.len());
     let trimmed = xml.trim_start();
     if !trimmed.starts_with('<') {
         // Plain-text sitemap: one absolute URL per line.
-        let urls = xml
+        let urls: Vec<String> = xml
             .lines()
             .map(str::trim)
             .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
             .map(|s| s.to_string())
             .collect();
+        debug!("parsed plain-text sitemap with {} URLs", urls.len());
         return ParsedSitemap {
             urls,
             nested_sitemaps: Vec::new(),

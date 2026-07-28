@@ -6,6 +6,8 @@
 //! appearing 100 times isn't 100x as relevant as one appearing once) and
 //! normalizing for document length.
 
+use log::trace;
+
 /// Computes the BM25 contribution of a single query term to a document's
 /// score.
 ///
@@ -34,7 +36,19 @@ pub fn bm25_term_score(
     let numerator = term_frequency * (k1 + 1.0);
     let denominator = term_frequency + k1 * length_norm;
 
-    idf * (numerator / denominator)
+    let score = idf * (numerator / denominator);
+    trace!(
+        "bm25_term: tf={} df={} total_docs={} doc_len={} avg_len={} k1={} b={} -> {}",
+        term_frequency,
+        document_frequency,
+        total_documents,
+        doc_length,
+        avg_doc_length,
+        k1,
+        b,
+        score
+    );
+    score
 }
 
 /// Robertson-Sparck-Jones inverse document frequency, as used by BM25.
@@ -66,6 +80,9 @@ mod tests {
 
     #[test]
     fn zero_frequency_yields_zero_score() {
-        assert_eq!(bm25_term_score(0.0, 10.0, 1000.0, 100.0, 100.0, 1.2, 0.75), 0.0);
+        assert_eq!(
+            bm25_term_score(0.0, 10.0, 1000.0, 100.0, 100.0, 1.2, 0.75),
+            0.0
+        );
     }
 }

@@ -20,7 +20,11 @@ pub enum QueryToken {
     /// A `key:value` filter such as `ext:rs`.
     Filter { key: String, value: String },
     /// A comparison filter such as `size>100KB` or `modified<7d`.
-    CompareFilter { key: String, op: char, value: String },
+    CompareFilter {
+        key: String,
+        op: char,
+        value: String,
+    },
     /// A fuzzy term such as `rustt~2` or `rustt~`.
     Fuzzy { term: String, distance: Option<u32> },
 }
@@ -158,9 +162,20 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                QueryToken::Filter { key: "ext".into(), value: "rs".into() },
-                QueryToken::CompareFilter { key: "size".into(), op: '>', value: "100KB".into() },
-                QueryToken::CompareFilter { key: "modified".into(), op: '<', value: "7d".into() },
+                QueryToken::Filter {
+                    key: "ext".into(),
+                    value: "rs".into()
+                },
+                QueryToken::CompareFilter {
+                    key: "size".into(),
+                    op: '>',
+                    value: "100KB".into()
+                },
+                QueryToken::CompareFilter {
+                    key: "modified".into(),
+                    op: '<',
+                    value: "7d".into()
+                },
             ]
         );
     }
@@ -171,8 +186,14 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                QueryToken::Fuzzy { term: "rustt".into(), distance: Some(2) },
-                QueryToken::Fuzzy { term: "other".into(), distance: None },
+                QueryToken::Fuzzy {
+                    term: "rustt".into(),
+                    distance: Some(2)
+                },
+                QueryToken::Fuzzy {
+                    term: "other".into(),
+                    distance: None
+                },
             ]
         );
     }

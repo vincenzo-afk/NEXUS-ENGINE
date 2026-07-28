@@ -4,4 +4,4 @@
 pub mod engine;
 pub mod snippet;
 
-pub use engine::{search};
+pub use engine::search;

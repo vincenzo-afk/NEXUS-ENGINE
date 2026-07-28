@@ -6,6 +6,7 @@
 
 use crate::error::{NexusError, Result};
 use crate::fs::CrawledFile;
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -90,6 +91,11 @@ impl Document {
             token_count: 0, // filled in by the indexer once tokenized
         };
 
+        debug!(
+            "document created: {} ({} bytes)",
+            file.path.display(),
+            file.size_bytes
+        );
         Ok(Document { metadata, content })
     }
 }

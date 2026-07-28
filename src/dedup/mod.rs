@@ -9,6 +9,7 @@
 //! fingerprints differ in only a handful of bits are almost certainly the
 //! same underlying content.
 
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -35,6 +36,7 @@ impl SimHash {
     /// then each shingle's hash is folded into a 64-dimension weighted
     /// vote, which is finally collapsed to a bit pattern.
     pub fn compute(text: &str) -> SimHash {
+        debug!("computing SimHash ({} bytes)", text.len());
         let normalized = crate::text::normalize(text);
         let tokens: Vec<String> = crate::text::tokenize(&normalized)
             .into_iter()
@@ -65,7 +67,9 @@ impl SimHash {
                 fingerprint |= 1 << bit;
             }
         }
-        SimHash(fingerprint)
+        let result = SimHash(fingerprint);
+        debug!("SimHash: {:016x}", result.0);
+        result
     }
 
     /// Hamming distance to another fingerprint: the number of differing bits.

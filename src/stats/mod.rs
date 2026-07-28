@@ -34,7 +34,9 @@ pub fn compute(index: &Index, config: &Config) -> IndexStats {
     let mut total_content_bytes = 0u64;
 
     for (_, meta) in index.store.iter() {
-        *files_by_extension.entry(meta.extension.clone()).or_insert(0) += 1;
+        *files_by_extension
+            .entry(meta.extension.clone())
+            .or_insert(0) += 1;
         total_content_bytes += meta.size_bytes;
     }
 
@@ -60,8 +62,14 @@ pub fn format_report(stats: &IndexStats) -> String {
     out.push_str("Nexus Index Statistics\n");
     out.push_str("=======================\n");
     out.push_str(&format!("Indexed files:        {}\n", stats.indexed_files));
-    out.push_str(&format!("Indexed folders:      {}\n", stats.indexed_folders));
-    out.push_str(&format!("Vocabulary size:      {}\n", stats.vocabulary_size));
+    out.push_str(&format!(
+        "Indexed folders:      {}\n",
+        stats.indexed_folders
+    ));
+    out.push_str(&format!(
+        "Vocabulary size:      {}\n",
+        stats.vocabulary_size
+    ));
     out.push_str(&format!("Posting count:        {}\n", stats.posting_count));
     out.push_str(&format!(
         "Avg. document length: {:.1} tokens\n",
@@ -79,7 +87,11 @@ pub fn format_report(stats: &IndexStats) -> String {
     let mut exts: Vec<(&String, &usize)> = stats.files_by_extension.iter().collect();
     exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     for (ext, count) in exts {
-        let label = if ext.is_empty() { "(none)" } else { ext.as_str() };
+        let label = if ext.is_empty() {
+            "(none)"
+        } else {
+            ext.as_str()
+        };
         out.push_str(&format!("  .{:<10} {}\n", label, count));
     }
     out

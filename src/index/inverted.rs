@@ -5,6 +5,8 @@
 //! with per-document term frequency and positions ready for ranking and
 //! phrase matching.
 
+use log::trace;
+
 use crate::document::DocId;
 use crate::index::posting::PostingList;
 use crate::index::vocabulary::TermId;
@@ -43,6 +45,7 @@ impl InvertedIndex {
                 .or_insert_with(PostingList::new)
                 .add_occurrence(doc_id, position);
         }
+        trace!("indexed {} postings for doc_id={}", terms.len(), doc_id);
         self.total_token_count += terms.len() as u64;
         self.document_count += 1;
     }
@@ -58,6 +61,7 @@ impl InvertedIndex {
             .total_token_count
             .saturating_sub(removed_token_count as u64);
         self.document_count = self.document_count.saturating_sub(1);
+        trace!("removed doc_id={} from inverted index", doc_id);
     }
 
     /// Looks up the posting list for a term ID.
