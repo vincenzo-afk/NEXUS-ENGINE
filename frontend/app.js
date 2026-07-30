@@ -29,6 +29,7 @@
     saved: [],
     historyOpen: false,
     savedOpen: false,
+    searchMode: 'web',
   };
 
   /* ========================================================================
@@ -79,6 +80,15 @@
     savedAdd: $('saved-add'),
     exportJsonBtn: $('export-json-btn'),
     exportCsvBtn: $('export-csv-btn'),
+    modeToggle: $('mode-toggle'),
+    modeToggleIcon: $('mode-toggle-icon'),
+    modeToggleLabel: $('mode-toggle-label'),
+    localLockBadge: $('local-lock-badge'),
+    filetypeChips: $('filetype-chips'),
+    torWarningCard: $('tor-warning-card'),
+    onionModal: $('onion-confirm-modal'),
+    onionConfirmOk: $('onion-confirm-ok'),
+    onionConfirmCancel: $('onion-confirm-cancel'),
   };
 
   /* ========================================================================
@@ -154,6 +164,7 @@
     if (filters.filetype) params.set('filetype', filters.filetype);
     if (filters.site) params.set('site', filters.site);
     if (filters.date) params.set('date', filters.date);
+    params.set('mode', state.searchMode);
     return `/search?${params.toString()}`;
   }
 
@@ -190,6 +201,23 @@
     const url = buildSearchUrl(state.query, state.page, state.filters);
     updateHash(state.query, state.page);
 
+    // The canonical bang table lives server-side (single source of
+    // truth); this is just a client-side heuristic ("does the query
+    // contain a !word token") to decide whether to do a full page
+    // navigation instead of a fetch(). That distinction matters because
+    // a real bang redirects to an external, cross-origin site (Google,
+    // GitHub, etc.) with no CORS headers of its own — fetch() would
+    // reject trying to read that response, while a native browser
+    // navigation follows redirects transparently regardless of origin.
+    // An unrecognized "!word" that isn't actually a configured bang just
+    // falls through to the ordinary JSON search response, which a full
+    // navigation would render as raw text — a graceful-enough
+    // degradation for what should be a rare case.
+    if (/(^|\s)!\w+/.test(state.query)) {
+      window.location.href = url;
+      return;
+    }
+
     fetch(url, {
       signal: state.abortController.signal,
       headers: { 'Accept': 'application/json' },
@@ -201,6 +229,8 @@
       .then(function (data) {
         state.totalResults = data.total || 0;
         state.hasMore = data.hasMore || false;
+        state.localCount = data.local_count || 0;
+        state.webCount = data.web_count || 0;
 
         const newResults = data.results || [];
         if (resetPage || state.page === 1) {
@@ -404,14 +434,35 @@
     state.results.forEach(function (result, i) {
       const card = document.createElement('article');
       card.className = 'result-card';
+      if (result.is_onion) card.classList.add('result-card-onion');
       card.setAttribute('role', 'listitem');
       card.dataset.index = i;
 
       const urlDiv = document.createElement('div');
       urlDiv.className = 'result-url';
-      urlDiv.innerHTML =
+
+      if (state.searchMode === 'both') {
+        const badge = document.createElement('span');
+        badge.className = 'result-source-badge';
+        badge.textContent = result.is_web ? '\u{1F310}' : '\u{1F4BB}';
+        badge.title = result.is_web ? 'Web result' : 'Local file';
+        urlDiv.appendChild(badge);
+      }
+
+      if (result.is_web && result.favicon) {
+        const favicon = document.createElement('img');
+        favicon.className = 'result-favicon';
+        favicon.src = result.favicon;
+        favicon.alt = '';
+        favicon.loading = 'lazy';
+        urlDiv.appendChild(favicon);
+      }
+
+      const urlText = document.createElement('span');
+      urlText.innerHTML =
         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>' +
-        escapeHtml(result.url || '');
+        escapeHtml(result.domain || result.url || '');
+      urlDiv.appendChild(urlText);
 
       const titleDiv = document.createElement('div');
       titleDiv.className = 'result-title';
@@ -431,8 +482,56 @@
 
       card.appendChild(urlDiv);
       card.appendChild(titleDiv);
+
+      if (!result.is_web && result.path) {
+        const breadcrumb = document.createElement('div');
+        breadcrumb.className = 'result-breadcrumb';
+        breadcrumb.textContent = '\u{1F512} ' + result.path;
+        card.appendChild(breadcrumb);
+      }
+
       card.appendChild(snippetDiv);
       if (parts.length) card.appendChild(metaDiv);
+
+      const actions = document.createElement('div');
+      actions.className = 'result-actions';
+
+      if (result.is_web) {
+        const visitBtn = document.createElement('a');
+        visitBtn.className = 'result-action-btn result-action-visit';
+        visitBtn.textContent = 'Visit';
+        visitBtn.href = result.url;
+        visitBtn.target = '_blank';
+        visitBtn.rel = 'noopener noreferrer';
+        visitBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          if (result.is_onion) {
+            e.preventDefault();
+            confirmOnionVisit(result.url);
+          }
+        });
+        actions.appendChild(visitBtn);
+
+        const cacheBtn = document.createElement('a');
+        cacheBtn.className = 'result-action-btn result-action-cache';
+        cacheBtn.textContent = 'Cache';
+        cacheBtn.href = '/view?url=' + encodeURIComponent(result.url);
+        cacheBtn.target = '_blank';
+        cacheBtn.rel = 'noopener noreferrer';
+        cacheBtn.addEventListener('click', function (e) { e.stopPropagation(); });
+        actions.appendChild(cacheBtn);
+      } else {
+        const openBtn = document.createElement('button');
+        openBtn.className = 'result-action-btn result-action-open';
+        openBtn.textContent = 'Open';
+        openBtn.type = 'button';
+        openBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          openLocalFile(result.path);
+        });
+        actions.appendChild(openBtn);
+      }
+      card.appendChild(actions);
 
       card.addEventListener('click', function () {
         openResult(i);
@@ -444,7 +543,11 @@
     const total = state.totalResults || state.results.length;
     const from = startingRank;
     const to = startingRank + state.results.length - 1;
-    el.resultsStats.textContent = 'About ' + total.toLocaleString() + ' results (' + from + '\u2013' + to + ').';
+    var statsText = 'About ' + total.toLocaleString() + ' results (' + from + '\u2013' + to + ').';
+    if (state.searchMode === 'both' && (state.localCount || state.webCount)) {
+      statsText += ' \u2014 ' + state.localCount + ' local \u00B7 ' + state.webCount + ' web';
+    }
+    el.resultsStats.textContent = statsText;
 
     if (state.hasMore && state.results.length >= state.pageSize) {
       el.moreSection.hidden = false;
@@ -466,12 +569,47 @@
      ======================================================================== */
   function openResult(index, newTab) {
     const result = state.results[index];
-    if (!result || !result.url) return;
+    if (!result) return;
+    if (!result.is_web) {
+      openLocalFile(result.path);
+      return;
+    }
+    if (result.is_onion) {
+      confirmOnionVisit(result.url);
+      return;
+    }
     if (newTab) {
       window.open(result.url, '_blank', 'noopener,noreferrer');
     } else {
       window.location.href = result.url;
     }
+  }
+
+  function openLocalFile(path) {
+    if (!path) return;
+    fetch('/open?path=' + encodeURIComponent(path))
+      .then(function (res) { return res.json().then(function (data) { return { ok: res.ok, data: data }; }); })
+      .then(function (result) {
+        if (!result.ok) {
+          window.alert('Could not open file: ' + (result.data && result.data.error ? result.data.error : 'unknown error'));
+        }
+      })
+      .catch(function () {
+        window.alert('Could not reach the server to open this file.');
+      });
+  }
+
+  var pendingOnionUrl = null;
+
+  function confirmOnionVisit(url) {
+    pendingOnionUrl = url;
+    el.onionModal.hidden = false;
+    el.onionConfirmOk.focus();
+  }
+
+  function closeOnionModal() {
+    pendingOnionUrl = null;
+    el.onionModal.hidden = true;
   }
 
   /* ========================================================================
@@ -810,6 +948,77 @@
   }
 
   /* ========================================================================
+     Search mode toggle (Local -> Web -> Hybrid -> Tor -> Local)
+     ======================================================================== */
+  var MODE_ORDER = ['local', 'web', 'both', 'tor'];
+  var MODE_META = {
+    local: { icon: '\u{1F4BB}', label: 'Local' },
+    web: { icon: '\u{1F310}', label: 'Web' },
+    both: { icon: '\u{1F500}', label: 'Hybrid' },
+    tor: { icon: '\u{1F9C5}', label: 'Tor' },
+  };
+
+  function cycleSearchMode() {
+    var currentIndex = MODE_ORDER.indexOf(state.searchMode);
+    var nextIndex = (currentIndex + 1) % MODE_ORDER.length;
+    setSearchMode(MODE_ORDER[nextIndex]);
+  }
+
+  function setSearchMode(mode) {
+    if (MODE_ORDER.indexOf(mode) === -1) mode = 'web';
+    state.searchMode = mode;
+    document.body.setAttribute('data-search-mode', mode);
+
+    el.modeToggle.classList.add('mode-switching');
+    setTimeout(function () {
+      var meta = MODE_META[mode];
+      el.modeToggleIcon.textContent = meta.icon;
+      el.modeToggleLabel.textContent = meta.label;
+      el.modeToggle.setAttribute('aria-label', 'Search mode: ' + meta.label + '. Click to cycle modes.');
+      el.modeToggle.classList.remove('mode-switching');
+    }, 120);
+
+    el.filetypeChips.hidden = mode !== 'local';
+    el.localLockBadge.hidden = mode !== 'local';
+    el.torWarningCard.hidden = true; // re-evaluated after the next search, if mode is tor
+
+    if (mode === 'tor') {
+      checkTorAvailability();
+    }
+
+    // Re-run the current query instantly on mode change, rather than
+    // waiting for the user to press Enter again.
+    if (state.query) {
+      doSearch(true);
+    }
+  }
+
+  function checkTorAvailability() {
+    fetch('/health')
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (state.searchMode === 'tor' && data && data.tor_configured === false) {
+          el.torWarningCard.hidden = false;
+        }
+      })
+      .catch(function () {
+        // If /health is unreachable at all, don't guess about Tor
+        // specifically — only show the warning when the server
+        // explicitly says Tor isn't configured.
+      });
+  }
+
+  function onFiletypeChipClick(e) {
+    var chip = e.target.closest('.chip');
+    if (!chip) return;
+    $$('.chip', el.filetypeChips).forEach(function (c) { c.classList.remove('chip-active'); });
+    chip.classList.add('chip-active');
+    state.filters.filetype = chip.dataset.filetype || '';
+    if (el.filterFiletype) el.filterFiletype.value = state.filters.filetype.split(',')[0] || '';
+    doSearch(true);
+  }
+
+  /* ========================================================================
      Loading / Error / Empty states
      ======================================================================== */
   function showLoading() {
@@ -1020,6 +1229,10 @@
     }
 
     if (e.key === 'Escape') {
+      if (!el.onionModal.hidden) {
+        closeOnionModal();
+        return;
+      }
       if (state.shortcutsOpen) {
         closeShortcutsHelp();
         return;
@@ -1073,6 +1286,22 @@
     showClearButton();
     loadHistory();
     loadSaved();
+
+    document.body.setAttribute('data-search-mode', state.searchMode);
+    var initialMeta = MODE_META[state.searchMode];
+    el.modeToggleIcon.textContent = initialMeta.icon;
+    el.modeToggleLabel.textContent = initialMeta.label;
+    el.localLockBadge.hidden = state.searchMode !== 'local';
+    el.modeToggle.addEventListener('click', cycleSearchMode);
+    el.filetypeChips.addEventListener('click', onFiletypeChipClick);
+    el.onionConfirmOk.addEventListener('click', function () {
+      var url = pendingOnionUrl;
+      closeOnionModal();
+      if (url) window.open(url, '_blank', 'noopener,noreferrer');
+    });
+    el.onionConfirmCancel.addEventListener('click', closeOnionModal);
+    var onionOverlay = el.onionModal.querySelector('.shortcuts-overlay');
+    if (onionOverlay) onionOverlay.addEventListener('click', closeOnionModal);
 
     el.input.addEventListener('input', onSearchInput);
     el.input.addEventListener('keydown', onSearchKeydown);

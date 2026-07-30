@@ -77,6 +77,17 @@ impl SimHash {
         (self.0 ^ other.0).count_ones()
     }
 
+    /// Expresses the fingerprint distance to `other` as a similarity
+    /// fraction in `[0.0, 1.0]`, where `1.0` is identical and `0.0` is
+    /// maximally different (all 64 bits differ). This is a coarse,
+    /// SimHash-specific notion of "percent similar" — useful for a
+    /// human-facing threshold like "hide it if it's more than 80% similar
+    /// to a result we're already showing" — not a rigorous content-overlap
+    /// percentage.
+    pub fn similarity(&self, other: &SimHash) -> f32 {
+        1.0 - (self.hamming_distance(other) as f32 / 64.0)
+    }
+
     /// `true` if this fingerprint is within [`SIMHASH_DUPLICATE_THRESHOLD`]
     /// bits of `other`.
     pub fn is_near_duplicate_of(&self, other: &SimHash) -> bool {
@@ -151,12 +162,26 @@ impl DuplicateIndex {
     }
 
     /// Registers `doc_id`'s content so future documents can be checked
-    /// against it.
+    /// against it. If `doc_id` was already registered (e.g. re-indexed
+    /// after a file change), its previous fuzzy-match entry is replaced
+    /// rather than left in place — otherwise repeated re-indexing of the
+    /// same document would accumulate stale entries in `fuzzy` forever.
     pub fn register(&mut self, doc_id: crate::document::DocId, text: &str) {
         let exact_hash = exact_content_hash(text);
         self.exact.insert(exact_hash, doc_id);
+        self.fuzzy.retain(|(id, _)| *id != doc_id);
         let sim = SimHash::compute(text);
         self.fuzzy.push((doc_id, sim));
+    }
+
+    /// Returns the registered fingerprint for `doc_id`, if it has been
+    /// registered. Used for cross-source (local vs. web) similarity
+    /// comparisons, e.g. by hybrid search mode's dedup step.
+    pub fn simhash_of(&self, doc_id: crate::document::DocId) -> Option<SimHash> {
+        self.fuzzy
+            .iter()
+            .find(|(id, _)| *id == doc_id)
+            .map(|(_, sim)| *sim)
     }
 
     /// Removes a previously-registered document (e.g. on re-crawl/removal).
@@ -230,5 +255,35 @@ mod tests {
             index.find_duplicate("Completely unrelated content about gardening tips."),
             None
         );
+    }
+
+    #[test]
+    fn re_registering_same_doc_id_replaces_rather_than_accumulates() {
+        let mut index = DuplicateIndex::new();
+        index.register(1, "original content about rust programming");
+        index.register(1, "updated content about python programming");
+        assert_eq!(index.len(), 1, "re-registering the same doc_id should not grow the fuzzy list");
+        let sim = index.simhash_of(1).unwrap();
+        assert_eq!(sim, SimHash::compute("updated content about python programming"));
+    }
+
+    #[test]
+    fn simhash_of_returns_none_for_unregistered_doc() {
+        let index = DuplicateIndex::new();
+        assert!(index.simhash_of(999).is_none());
+    }
+
+    #[test]
+    fn similarity_is_one_for_identical_hashes() {
+        let a = SimHash::compute("some shared content");
+        assert_eq!(a.similarity(&a), 1.0);
+    }
+
+    #[test]
+    fn similarity_reflects_hamming_distance() {
+        let a = SimHash(0b0000_0000);
+        let b = SimHash(0b0000_1111); // 4 bits differ out of 64
+        let expected = 1.0 - (4.0 / 64.0);
+        assert!((a.similarity(&b) - expected).abs() < 1e-6);
     }
 }

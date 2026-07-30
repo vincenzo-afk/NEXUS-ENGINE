@@ -73,7 +73,8 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
             offset,
             explain,
             no_snippets,
-        } => cmd_search(&config, &query, limit, offset, explain, no_snippets),
+            mode,
+        } => cmd_search(&config, &query, limit, offset, explain, no_snippets, &mode),
         Commands::Watch => cmd_watch(&config),
         Commands::Rebuild => cmd_rebuild(&config),
         Commands::Stats => cmd_stats(&config),
@@ -213,11 +214,13 @@ fn cmd_search(
     offset: usize,
     explain: bool,
     no_snippets: bool,
+    mode_str: &str,
 ) -> Result<()> {
     debug!(
-        "search command: query='{}', limit={}, offset={}",
-        query_str, limit, offset
+        "search command: query='{}', limit={}, offset={}, mode={}",
+        query_str, limit, offset, mode_str
     );
+    let mode = crate::search::SearchMode::from_query_param(mode_str);
 
     let bang_table = crate::bangs::BangTable::from_builtin();
     if let Some(bang_match) = bang_table.resolve(query_str) {
@@ -236,14 +239,21 @@ fn cmd_search(
         return Ok(());
     }
 
+    if mode == crate::search::SearchMode::Tor && index.web.iter().all(|(_, m)| !m.url.to_lowercase().contains(".onion")) {
+        println!("Tor mode: no .onion pages are currently indexed.");
+        println!("Crawl some first (e.g. `nexus crawl <onion-url> --ignore-robots` over a Tor proxy), then search again.");
+        return Ok(());
+    }
+
     let clicks = ClickLog::load(&config.clicks_path).unwrap_or_default();
     let content_cache = ContentCache::new(config.content_cache_dir.clone());
 
     let started = Instant::now();
     let ast = query::parse(query_str)?;
     debug!("query AST: {:?}", ast);
-    let (results, _) =
-        crate::search::search(&index, &ast, &config.ranking, offset, limit, Some(&clicks));
+    let outcome =
+        crate::search::search(&index, &ast, &config.ranking, offset, limit, Some(&clicks), mode);
+    let results = outcome.results;
     let elapsed = started.elapsed();
     debug!(
         "search returned {} results in {:.2}ms",
@@ -259,22 +269,34 @@ fn cmd_search(
     }
 
     println!(
-        "{} result(s) in {:.2}ms\n",
-        results.len(),
-        elapsed.as_secs_f64() * 1000.0
+        "{} result(s) in {:.2}ms ({} local, {} web)\n",
+        outcome.total,
+        elapsed.as_secs_f64() * 1000.0,
+        outcome.local_count,
+        outcome.web_count,
     );
 
     for (rank, result) in results.iter().enumerate() {
         let web_meta = index.web.get(result.doc_id);
+        let badge = if result.is_onion {
+            "\u{1F9C5}" // onion
+        } else if result.is_web {
+            "\u{1F310}" // globe (web)
+        } else {
+            "\u{1F4BB}" // laptop (local)
+        };
         let label = web_meta.map(|m| m.title.as_str()).filter(|t| !t.is_empty());
         println!(
-            "{}. {}  [score {:.3}]",
+            "{}. {} {}  [score {:.3}]",
             offset + rank + 1,
+            badge,
             label.unwrap_or_else(|| result.path.to_str().unwrap_or_default()),
             result.score
         );
         if web_meta.is_some() {
             println!("   {}", result.path.display());
+        } else {
+            println!("   \u{1F512} {} (local file, nothing leaves your machine)", result.path.display());
         }
         println!(
             "   {} | {} matches{}",
@@ -808,14 +830,16 @@ fn cmd_click(config: &Config, query_str: &str, rank: usize) -> Result<()> {
     // user saw (absent an index change in between), so we don't need to
     // separately persist "last shown results" state just to resolve which
     // document a rank number refers to.
-    let (results, _) = crate::search::search(
+    let outcome = crate::search::search(
         &index,
         &ast,
         &config.ranking,
         0,
         rank,
         Some(&existing_clicks),
+        crate::search::SearchMode::default(),
     );
+    let results = outcome.results;
     let Some(result) = results.get(rank - 1) else {
         warn!("no result at rank {} for '{}'", rank, query_str);
         println!("no result at rank {} for '{}'", rank, query_str);
@@ -960,7 +984,16 @@ fn cmd_benchmark(config: &Config, iterations: usize, queries_file: Option<PathBu
         let query_str = &queries[i % queries.len()];
         let started = Instant::now();
         let ast = query::parse(query_str).unwrap_or_else(|_| query::parse("test").unwrap());
-        let (results, _) = crate::search::search(&index, &ast, &config.ranking, 0, 10, None);
+        let outcome = crate::search::search(
+            &index,
+            &ast,
+            &config.ranking,
+            0,
+            10,
+            None,
+            crate::search::SearchMode::Both,
+        );
+        let results = outcome.results;
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
 
         total_time += elapsed;

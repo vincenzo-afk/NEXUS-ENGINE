@@ -27,7 +27,7 @@ use log::{debug, info};
 use serde::Serialize;
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tiny_http::{Header, Method, Response, Server};
 use chrono::TimeZone;
 
@@ -36,12 +36,21 @@ use chrono::TimeZone;
 struct ApiResult {
     rank: usize,
     url: String,
+    /// Local-filesystem path, for Local/Hybrid mode result cards that
+    /// need the raw path (breadcrumb display, the `/open` button) rather
+    /// than the `/view/...` cache-viewer URL `url` points to.
+    path: String,
     title: String,
     score: f32,
     snippet: String,
     match_count: usize,
     is_web: bool,
+    is_onion: bool,
+    /// `"fs"` or `"web"` — an explicit, self-describing companion to
+    /// `is_web` for clients that would rather match on a string.
+    source_type: String,
     domain: Option<String>,
+    favicon: Option<String>,
     size: String,
     date: String,
     filetype: String,
@@ -51,7 +60,14 @@ struct ApiResult {
 #[derive(Debug, Serialize)]
 struct ApiResponse {
     query: String,
+    mode: String,
     total: usize,
+    /// Of `total`, how many are local filesystem results (meaningful
+    /// mainly in hybrid mode; 0 for pure Web/Tor mode, equal to `total`
+    /// for pure Local mode).
+    local_count: usize,
+    /// Of `total`, how many are web results.
+    web_count: usize,
     took_ms: f64,
     results: Vec<ApiResult>,
     #[serde(rename = "hasMore")]
@@ -212,6 +228,14 @@ fn handle_request(
                 "status": "ok",
                 "documents": index.document_count(),
                 "web_pages": index.web.len(),
+                // Whether a Tor SOCKS5 proxy is configured (config.toml's
+                // [tor] enabled = true), not a live reachability probe —
+                // an actual connection check to the Tor network would add
+                // real latency to every /health call, which is too
+                // expensive for something the frontend polls on every
+                // switch into Tor mode. `nexus tor --check` does the full
+                // live check when you actually want it.
+                "tor_configured": config.tor.enabled,
             })
             .to_string();
             let mut response = Response::from_string(body).with_header(json_header);
@@ -385,27 +409,24 @@ fn handle_request(
         }
         path if path.starts_with("/view/") => {
             let file_path_str = &path["/view/".len()..];
-            if let Ok(decoded) = urlencoding::decode(file_path_str) {
-                let file_path = Path::new(decoded.as_ref());
-                if file_path.exists() && file_path.is_file() {
-                    if let Ok(content) = std::fs::read(file_path) {
-                        let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let content_type = match extension {
-                            "html" | "htm" => "text/html; charset=utf-8",
-                            "css" => "text/css; charset=utf-8",
-                            "js" => "application/javascript; charset=utf-8",
-                            "json" => "application/json; charset=utf-8",
-                            "txt" | "rs" | "toml" | "py" | "c" | "cpp" | "h" | "md" | "sh" | "go" | "yaml" | "yml" => "text/plain; charset=utf-8",
-                            _ => "application/octet-stream",
-                        };
-                        let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
-                        let mut response = Response::from_data(content).with_header(header);
-                        if !config.security.cors_allowed_origins.is_empty() {
-                            response = response.with_header(cors_header);
-                        }
-                        let _ = request.respond(response);
-                        return;
+            if let Some(file_path) = resolve_indexed_path(index, file_path_str) {
+                if let Ok(content) = std::fs::read(&file_path) {
+                    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let content_type = match extension {
+                        "html" | "htm" => "text/html; charset=utf-8",
+                        "css" => "text/css; charset=utf-8",
+                        "js" => "application/javascript; charset=utf-8",
+                        "json" => "application/json; charset=utf-8",
+                        "txt" | "rs" | "toml" | "py" | "c" | "cpp" | "h" | "md" | "sh" | "go" | "yaml" | "yml" => "text/plain; charset=utf-8",
+                        _ => "application/octet-stream",
+                    };
+                    let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap();
+                    let mut response = Response::from_data(content).with_header(header);
+                    if !config.security.cors_allowed_origins.is_empty() {
+                        response = response.with_header(cors_header);
                     }
+                    let _ = request.respond(response);
+                    return;
                 }
             }
             let mut response = Response::from_string("File Not Found").with_status_code(404);
@@ -413,6 +434,54 @@ fn handle_request(
                 response = response.with_header(cors_header);
             }
             let _ = request.respond(response);
+        }
+        "/open" => {
+            let params = parse_query_string(query);
+            let requested = params.get("path").cloned().unwrap_or_default();
+            if requested.is_empty() {
+                let body = serde_json::to_string(&ApiError {
+                    error: "missing required query parameter 'path'".to_string(),
+                })
+                .unwrap_or_default();
+                let mut response = Response::from_string(body).with_status_code(400).with_header(json_header);
+                if !config.security.cors_allowed_origins.is_empty() {
+                    response = response.with_header(cors_header);
+                }
+                let _ = request.respond(response);
+                return;
+            }
+
+            let Some(file_path) = resolve_indexed_path(index, &requested) else {
+                let body = serde_json::to_string(&ApiError {
+                    error: "path not found in index (only indexed local files may be opened)".to_string(),
+                })
+                .unwrap_or_default();
+                let mut response = Response::from_string(body).with_status_code(404).with_header(json_header);
+                if !config.security.cors_allowed_origins.is_empty() {
+                    response = response.with_header(cors_header);
+                }
+                let _ = request.respond(response);
+                return;
+            };
+
+            match open_in_default_app(&file_path) {
+                Ok(()) => {
+                    let body = serde_json::json!({"status": "opened", "path": file_path.to_string_lossy()}).to_string();
+                    let mut response = Response::from_string(body).with_header(json_header);
+                    if !config.security.cors_allowed_origins.is_empty() {
+                        response = response.with_header(cors_header);
+                    }
+                    let _ = request.respond(response);
+                }
+                Err(e) => {
+                    let body = serde_json::to_string(&ApiError { error: e }).unwrap_or_default();
+                    let mut response = Response::from_string(body).with_status_code(500).with_header(json_header);
+                    if !config.security.cors_allowed_origins.is_empty() {
+                        response = response.with_header(cors_header);
+                    }
+                    let _ = request.respond(response);
+                }
+            }
         }
         "/" | "/index.html" | "/style.css" | "/app.js" => {
             if let Some(ref dir) = frontend_dir {
@@ -506,7 +575,14 @@ fn run_search(
         QueryNode::And(and_children)
     };
 
-    let (results, total) = search::search(index, &combined_ast, ranking, offset, limit, None);
+    let mode = params
+        .get("mode")
+        .map(|s| search::SearchMode::from_query_param(s))
+        .unwrap_or_default();
+
+    let outcome = search::search(index, &combined_ast, ranking, offset, limit, None, mode);
+    let (results, total, local_count, web_count) =
+        (outcome.results, outcome.total, outcome.local_count, outcome.web_count);
     let took_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let terms: HashSet<String> = crate::query::collect_terms(&combined_ast);
@@ -538,15 +614,23 @@ fn run_search(
                 format!("/view/{}", urlencoding::encode(&r.path.to_string_lossy()))
             };
 
+            let favicon = web_meta.map(|m| {
+                format!("https://www.google.com/s2/favicons?domain={}", m.domain)
+            });
+
             ApiResult {
                 rank: offset + i + 1,
                 url,
+                path: r.path.to_string_lossy().to_string(),
                 title: r.file_name.clone(),
                 score: r.score,
                 snippet: snippet_text,
                 match_count: r.match_count,
-                is_web: web_meta.is_some(),
+                is_web: r.is_web,
+                is_onion: r.is_onion,
+                source_type: if r.is_web { "web".to_string() } else { "fs".to_string() },
                 domain: web_meta.map(|m| m.domain.clone()),
+                favicon,
                 size: size_str,
                 date: date_str,
                 filetype: extension,
@@ -558,15 +642,184 @@ fn run_search(
 
     Ok(ApiResponse {
         query: query_str.to_string(),
+        mode: format!("{:?}", mode).to_lowercase(),
         total,
+        local_count,
+        web_count,
         took_ms,
         results,
         has_more,
     })
 }
 
+/// Resolves a `/view/` or `/open` path parameter to an actual filesystem
+/// path — but only if that exact path is already present in the index as
+/// a local (non-web) document.
+///
+/// This is the path-traversal protection for both endpoints: rather than
+/// attempting to sanitize an arbitrary attacker-controlled path string
+/// (blocklisting `..`, symlink checks, etc. — an easy category of bugs to
+/// get subtly wrong), only paths that are already known-good (because
+/// they came from indexing a real, explicitly-added folder) are ever
+/// served or opened. A request for `/view/%2Fetc%2Fpasswd` or
+/// `/open?path=../../etc/passwd` simply won't match anything in the
+/// index and gets a 404, regardless of how the traversal is encoded.
+fn resolve_indexed_path(index: &Index, raw_path_param: &str) -> Option<PathBuf> {
+    let decoded = urlencoding::decode(raw_path_param).ok()?;
+    if decoded.contains("..") {
+        return None;
+    }
+    let candidate = PathBuf::from(decoded.as_ref());
+    let doc_id = index.store.id_for_path(&candidate)?;
+    let metadata = index.store.get(doc_id)?;
+    if index.web.get(doc_id).is_some() {
+        // It's a web document (its "path" is a URL, not a filesystem
+        // path) — never valid for /view or /open.
+        return None;
+    }
+    if metadata.path.exists() && metadata.path.is_file() {
+        Some(metadata.path.clone())
+    } else {
+        None
+    }
+}
+
+/// Opens `path` in the OS's default application for its file type:
+/// `xdg-open` on Linux, `open` on macOS, `cmd /C start` on Windows.
+fn open_in_default_app(path: &std::path::Path) -> std::result::Result<(), String> {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(path).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path).spawn()
+    };
+
+    match result {
+        Ok(mut child) => {
+            // Don't block the request thread waiting for the opened
+            // application to exit (a text editor or browser can stay
+            // open indefinitely) — just confirm the launcher command
+            // itself started successfully, then let it run detached.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(e) => Err(format!("failed to launch default application: {e}")),
+    }
+}
+
 fn parse_query_string(query: &str) -> std::collections::HashMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Document, DocumentMetadata};
+
+    fn index_with_local_file() -> (Index, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nexus-api-test-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("notes.txt");
+        std::fs::write(&file_path, "hello from a real indexed file").unwrap();
+
+        let mut index = Index::new();
+        let metadata = DocumentMetadata {
+            path: file_path.clone(),
+            file_name: "notes.txt".to_string(),
+            extension: "txt".to_string(),
+            size_bytes: 30,
+            modified_unix: 0,
+            token_count: 0,
+        };
+        index.index_document(Document {
+            metadata,
+            content: "hello from a real indexed file".to_string(),
+        });
+
+        (index, file_path)
+    }
+
+    #[test]
+    fn resolves_a_path_that_is_actually_indexed() {
+        let (index, file_path) = index_with_local_file();
+        let resolved = resolve_indexed_path(&index, &file_path.to_string_lossy());
+        assert_eq!(resolved, Some(file_path.clone()));
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rejects_path_traversal_attempts() {
+        let (index, file_path) = index_with_local_file();
+        // Even if an attacker guesses the real indexed path's directory
+        // and appends a traversal sequence, the literal ".." check plus
+        // the "must match an indexed path exactly" rule both reject it.
+        let traversal = format!("{}/../../../etc/passwd", file_path.parent().unwrap().display());
+        assert!(resolve_indexed_path(&index, &traversal).is_none());
+        assert!(resolve_indexed_path(&index, "../../../etc/passwd").is_none());
+        assert!(resolve_indexed_path(&index, "/etc/passwd").is_none());
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rejects_paths_not_present_in_the_index() {
+        let (index, file_path) = index_with_local_file();
+        let sibling = file_path.parent().unwrap().join("not-indexed.txt");
+        std::fs::write(&sibling, "not part of the index").unwrap();
+        assert!(resolve_indexed_path(&index, &sibling.to_string_lossy()).is_none());
+        std::fs::remove_dir_all(file_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rejects_web_document_paths() {
+        let mut index = Index::new();
+        let metadata = DocumentMetadata {
+            path: PathBuf::from("https://example.com/page"),
+            file_name: "Example Page".to_string(),
+            extension: "html".to_string(),
+            size_bytes: 10,
+            modified_unix: 0,
+            token_count: 0,
+        };
+        let doc_id = index.index_document(Document {
+            metadata,
+            content: "web content".to_string(),
+        });
+        index.web.insert(
+            doc_id,
+            crate::webdoc::WebPageMeta {
+                url: "https://example.com/page".to_string(),
+                domain: "example.com".to_string(),
+                title: "Example Page".to_string(),
+                meta_description: String::new(),
+                lang: None,
+                author: None,
+                content_type: "html".to_string(),
+                fetched_unix: 0,
+                etag: None,
+                last_modified: None,
+                redirect_chain: Vec::new(),
+                simhash: 0,
+                depth: 0,
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                pagerank: 0.0,
+            },
+        );
+
+        assert!(resolve_indexed_path(&index, "https://example.com/page").is_none());
+    }
+
+    #[test]
+    fn empty_path_param_is_rejected() {
+        let index = Index::new();
+        assert!(resolve_indexed_path(&index, "").is_none());
+    }
 }

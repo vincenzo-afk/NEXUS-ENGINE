@@ -362,7 +362,6 @@ impl WebCrawler {
             };
             let doc_id = index.index_document(document);
             content_cache.store(doc_id, &indexable_text)?;
-            index.duplicates.register(doc_id, &indexable_text);
 
             let web_meta = WebPageMeta {
                 url: entry.url.clone(),

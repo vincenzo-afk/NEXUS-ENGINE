@@ -3,22 +3,71 @@
 //! the ranking stage needs.
 
 use log::{debug, info};
+use serde::{Deserialize, Serialize};
 
 use crate::document::DocId;
 use crate::index::Index;
 use crate::query::{CompareOp, QueryNode};
 use crate::ranking::{self, MatchInfo, ScoreExplanation};
 use crate::spellcheck::levenshtein_distance;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Which subset of the index a search should draw from — the core of the
+/// four-mode toggle (Local / Web / Hybrid / Tor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    /// Only filesystem-indexed documents.
+    Local,
+    /// Only web-crawled documents, excluding `.onion` addresses (those
+    /// belong to [`SearchMode::Tor`] only, so a plain web search never
+    /// surfaces a hidden-service link a browser can't open anyway).
+    Web,
+    /// Both filesystem and web documents, merged into one ranked list
+    /// with a local-result boost and cross-source duplicate suppression.
+    Both,
+    /// Only web-crawled documents whose URL is a `.onion` address.
+    /// Deliberately kept separate from ordinary [`SearchMode::Web`]
+    /// results rather than merged in: `.onion` links need Tor Browser to
+    /// open at all, so mixing them into a normal web result list would
+    /// be confusing and mildly risky (an accidental click).
+    Tor,
+}
+
+impl Default for SearchMode {
+    fn default() -> Self {
+        SearchMode::Web
+    }
+}
+
+impl SearchMode {
+    /// Parses a mode from a loosely-typed string (e.g. an HTTP query
+    /// parameter), accepting a few reasonable synonyms. Falls back to the
+    /// default ([`SearchMode::Web`]) for anything unrecognized rather than
+    /// erroring — an unknown `mode` value shouldn't break a search.
+    pub fn from_query_param(s: &str) -> SearchMode {
+        match s.to_lowercase().as_str() {
+            "local" | "fs" | "pc" | "filesystem" => SearchMode::Local,
+            "web" => SearchMode::Web,
+            "both" | "hybrid" => SearchMode::Both,
+            "tor" | "onion" => SearchMode::Tor,
+            _ => SearchMode::default(),
+        }
+    }
+}
 
 /// A single ranked search result, ready for presentation.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     /// The document's ID within the index.
     pub doc_id: DocId,
-    /// Full path to the matched file.
+    /// Full path to the matched file (a filesystem path for local
+    /// results, a URL string for web results).
     pub path: std::path::PathBuf,
-    /// File name only.
+    /// File name only (for web results, this is the page title if one
+    /// was extracted, matching how the rest of the ranking pipeline
+    /// already treats a web page's title as its "filename" — see
+    /// `ranking::MatchInfo::filename_match`'s doc comment).
     pub file_name: String,
     /// File size in bytes.
     pub size_bytes: u64,
@@ -30,7 +79,36 @@ pub struct SearchResult {
     pub score: f32,
     /// Full scoring breakdown, useful with `--explain`.
     pub explanation: ScoreExplanation,
+    /// `true` if this result came from the web crawler rather than local
+    /// filesystem indexing.
+    pub is_web: bool,
+    /// `true` if this is a web result whose URL is a `.onion` address.
+    pub is_onion: bool,
 }
+
+/// The result of a search: the paginated result page, plus counts useful
+/// for presentation (e.g. hybrid mode's "5 local · 12 web" split).
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    /// The requested page of results.
+    pub results: Vec<SearchResult>,
+    /// Total matching documents after mode filtering and (for hybrid
+    /// mode) cross-source dedup, before pagination.
+    pub total: usize,
+    /// Of `total`, how many are local filesystem results.
+    pub local_count: usize,
+    /// Of `total`, how many are web results.
+    pub web_count: usize,
+}
+
+/// Above this many pre-pagination candidates, hybrid mode's O(n^2)
+/// cross-source duplicate comparison is skipped rather than run
+/// unbounded. This is a genuine, documented tradeoff: on very broad
+/// queries against a large combined index, a full pairwise SimHash
+/// comparison would be too slow to run per-request, so extremely broad
+/// hybrid queries may show occasional near-duplicate local/web pairs
+/// rather than blocking. Bump this if profiling shows headroom.
+const HYBRID_DEDUP_MAX_CANDIDATES: usize = 500;
 
 pub fn search(
     index: &Index,
@@ -39,16 +117,53 @@ pub fn search(
     offset: usize,
     limit: usize,
     clicks: Option<&crate::clicks::ClickLog>,
-) -> (Vec<SearchResult>, usize) {
-    info!("search query: {:?}", query);
+    mode: SearchMode,
+) -> SearchOutcome {
+    info!("search query: {:?} (mode={:?})", query, mode);
     let matches = evaluate(query, index);
-    let total_matches = matches.len();
     let now_unix = chrono::Utc::now().timestamp();
 
     let mut results: Vec<SearchResult> = matches
         .into_iter()
         .filter_map(|(doc_id, mut match_info)| {
             let metadata = index.store.get(doc_id)?;
+            let web_meta = index.web.get(doc_id);
+            let is_web = web_meta.is_some();
+            let is_onion = web_meta
+                .map(|m| m.url.to_lowercase().contains(".onion"))
+                .unwrap_or(false);
+
+            // Mode filtering happens before scoring/pagination so offset
+            // and limit apply to the *filtered* set, not the full match
+            // set with out-of-mode results silently consuming page slots.
+            match mode {
+                SearchMode::Local => {
+                    if is_web {
+                        return None;
+                    }
+                }
+                SearchMode::Web => {
+                    if !is_web || is_onion {
+                        return None;
+                    }
+                }
+                SearchMode::Tor => {
+                    if !is_web || !is_onion {
+                        return None;
+                    }
+                }
+                SearchMode::Both => {
+                    // No source filtering; every match is a candidate.
+                    // .onion results are still excluded from hybrid mode
+                    // for the same reason Web mode excludes them: they
+                    // need Tor Browser specifically, and hybrid mode's
+                    // whole point is "give me an ordinary merged view."
+                    if is_onion {
+                        return None;
+                    }
+                }
+            }
+
             if !match_info.filename_match {
                 match_info.filename_match = !match_info.term_frequencies.is_empty()
                     && match_info
@@ -65,8 +180,12 @@ pub fn search(
                         .any(|term| path_lower.contains(term.as_str()));
             }
 
-            let explanation =
+            let mut explanation =
                 ranking::score_document(index, doc_id, &match_info, config, now_unix, clicks)?;
+
+            if mode == SearchMode::Both && !is_web {
+                explanation.final_score *= config.local_boost;
+            }
 
             Some(SearchResult {
                 doc_id,
@@ -77,18 +196,95 @@ pub fn search(
                 match_count: match_info.term_frequencies.len(),
                 score: explanation.final_score,
                 explanation,
+                is_web,
+                is_onion,
             })
         })
         .collect();
 
-    debug!("search returned {} raw results", results.len());
+    debug!("search returned {} raw results (mode={:?})", results.len(), mode);
+
+    if mode == SearchMode::Both {
+        results = dedupe_hybrid_cross_source(index, results, config.hybrid_dedup_min_similarity);
+    }
+
     results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    let total = results.len();
+    let local_count = results.iter().filter(|r| !r.is_web).count();
+    let web_count = total - local_count;
+
     let paginated = results.into_iter().skip(offset).take(limit).collect();
-    (paginated, total_matches)
+    SearchOutcome {
+        results: paginated,
+        total,
+        local_count,
+        web_count,
+    }
+}
+
+/// Hybrid mode's cross-source dedup: when a local file and a web page are
+/// near-duplicate content (SimHash similarity at or above
+/// `min_similarity`), only the local result is kept — "you already have
+/// this on disk" outranks "here's a copy of it on the web."
+///
+/// Skips the comparison entirely (returning `results` unchanged) once the
+/// pre-pagination candidate count exceeds [`HYBRID_DEDUP_MAX_CANDIDATES`],
+/// since this is an O(n^2) pairwise comparison; see that constant's doc
+/// comment for the tradeoff this represents.
+fn dedupe_hybrid_cross_source(
+    index: &Index,
+    results: Vec<SearchResult>,
+    min_similarity: f32,
+) -> Vec<SearchResult> {
+    if results.len() > HYBRID_DEDUP_MAX_CANDIDATES {
+        debug!(
+            "hybrid dedup skipped: {} candidates exceeds cap of {}",
+            results.len(),
+            HYBRID_DEDUP_MAX_CANDIDATES
+        );
+        return results;
+    }
+
+    let local_fingerprints: Vec<(DocId, crate::dedup::SimHash)> = results
+        .iter()
+        .filter(|r| !r.is_web)
+        .filter_map(|r| index.duplicates.simhash_of(r.doc_id).map(|s| (r.doc_id, s)))
+        .collect();
+
+    if local_fingerprints.is_empty() {
+        return results;
+    }
+
+    let mut to_remove: HashSet<DocId> = HashSet::new();
+    for result in results.iter().filter(|r| r.is_web) {
+        let Some(web_sim) = index.duplicates.simhash_of(result.doc_id) else {
+            continue;
+        };
+        let is_duplicate_of_a_local_file = local_fingerprints
+            .iter()
+            .any(|(_, local_sim)| local_sim.similarity(&web_sim) >= min_similarity);
+        if is_duplicate_of_a_local_file {
+            to_remove.insert(result.doc_id);
+        }
+    }
+
+    if to_remove.is_empty() {
+        return results;
+    }
+
+    debug!(
+        "hybrid dedup: removing {} web result(s) that duplicate a local file",
+        to_remove.len()
+    );
+    results
+        .into_iter()
+        .filter(|r| !to_remove.contains(&r.doc_id))
+        .collect()
 }
 
 /// Recursively evaluates a query node against the index, returning the
@@ -298,7 +494,6 @@ fn match_phrase(terms: &[String], index: &Index) -> HashMap<DocId, MatchInfo> {
 /// `position_lists[0]` contains `p`, `position_lists[1]` contains `p+1`,
 /// `position_lists[2]` contains `p+2`, etc.
 fn has_consecutive_run(position_lists: &[&Vec<u32>]) -> bool {
-    use std::collections::HashSet;
     let first_term_positions = position_lists[0];
     let later_sets: Vec<HashSet<u32>> = position_lists[1..]
         .iter()
@@ -417,6 +612,9 @@ fn wildcard_recursive(pattern: &[char], text: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{Document, DocumentMetadata};
+    use crate::webdoc::WebPageMeta;
+    use std::path::PathBuf;
 
     #[test]
     fn glob_matching_basics() {
@@ -424,5 +622,220 @@ mod tests {
         assert!(wildcard_matches("pars*", "parser"));
         assert!(wildcard_matches("*ing", "parsing"));
         assert!(!wildcard_matches("wor?d", "words"));
+    }
+
+    fn index_local(index: &mut Index, path: &str, content: &str) -> DocId {
+        let metadata = DocumentMetadata {
+            path: PathBuf::from(path),
+            file_name: path.trim_start_matches('/').to_string(),
+            extension: "txt".to_string(),
+            size_bytes: content.len() as u64,
+            modified_unix: 0,
+            token_count: 0,
+        };
+        index.index_document(Document { metadata, content: content.to_string() })
+    }
+
+    fn index_web(index: &mut Index, url: &str, title: &str, content: &str) -> DocId {
+        let metadata = DocumentMetadata {
+            path: PathBuf::from(url),
+            file_name: title.to_string(),
+            extension: "html".to_string(),
+            size_bytes: content.len() as u64,
+            modified_unix: 0,
+            token_count: 0,
+        };
+        let doc_id = index.index_document(Document { metadata, content: content.to_string() });
+        index.web.insert(
+            doc_id,
+            WebPageMeta {
+                url: url.to_string(),
+                domain: "example.com".to_string(),
+                title: title.to_string(),
+                meta_description: String::new(),
+                lang: None,
+                author: None,
+                content_type: "html".to_string(),
+                fetched_unix: 0,
+                etag: None,
+                last_modified: None,
+                redirect_chain: Vec::new(),
+                simhash: 0,
+                depth: 0,
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                pagerank: 0.0,
+            },
+        );
+        doc_id
+    }
+
+    fn parse_and_search(
+        index: &Index,
+        query: &str,
+        mode: SearchMode,
+    ) -> SearchOutcome {
+        let ast = crate::query::parse(query).unwrap();
+        let config = crate::config::RankingConfig::default();
+        search(index, &ast, &config, 0, 50, None, mode)
+    }
+
+    #[test]
+    fn local_mode_excludes_web_results() {
+        let mut index = Index::new();
+        index_local(&mut index, "/notes.txt", "rust programming notes");
+        index_web(&mut index, "https://example.com/rust", "Rust Guide", "rust programming guide");
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Local);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!outcome.results[0].is_web);
+        assert_eq!(outcome.web_count, 0);
+        assert_eq!(outcome.local_count, 1);
+    }
+
+    #[test]
+    fn web_mode_excludes_local_results_and_onion_addresses() {
+        let mut index = Index::new();
+        index_local(&mut index, "/notes.txt", "rust programming notes");
+        index_web(&mut index, "https://example.com/rust", "Rust Guide", "rust programming guide");
+        index_web(
+            &mut index,
+            "http://exampleonionaddr1234567890abcdefghijklmnopqrstuvwxyz234567.onion/rust",
+            "Onion Rust",
+            "rust programming onion",
+        );
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Web);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].is_web);
+        assert!(!outcome.results[0].is_onion);
+        assert_eq!(outcome.results[0].file_name, "Rust Guide");
+    }
+
+    #[test]
+    fn tor_mode_only_returns_onion_addresses() {
+        let mut index = Index::new();
+        index_local(&mut index, "/notes.txt", "rust programming notes");
+        index_web(&mut index, "https://example.com/rust", "Rust Guide", "rust programming guide");
+        index_web(
+            &mut index,
+            "http://exampleonionaddr1234567890abcdefghijklmnopqrstuvwxyz234567.onion/rust",
+            "Onion Rust",
+            "rust programming onion",
+        );
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Tor);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].is_onion);
+        assert_eq!(outcome.results[0].file_name, "Onion Rust");
+    }
+
+    #[test]
+    fn tor_mode_returns_empty_when_no_onion_docs_indexed() {
+        let mut index = Index::new();
+        index_local(&mut index, "/notes.txt", "rust programming notes");
+        index_web(&mut index, "https://example.com/rust", "Rust Guide", "rust programming guide");
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Tor);
+        assert!(outcome.results.is_empty());
+        assert_eq!(outcome.total, 0);
+    }
+
+    #[test]
+    fn both_mode_merges_local_and_web_and_excludes_onion() {
+        let mut index = Index::new();
+        index_local(&mut index, "/notes.txt", "rust programming notes");
+        index_web(&mut index, "https://example.com/rust", "Rust Guide", "rust programming guide");
+        index_web(
+            &mut index,
+            "http://exampleonionaddr1234567890abcdefghijklmnopqrstuvwxyz234567.onion/rust",
+            "Onion Rust",
+            "rust programming onion",
+        );
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Both);
+        assert_eq!(outcome.results.len(), 2, "should include the local file and the clearnet web page, not the onion one");
+        assert!(outcome.results.iter().any(|r| !r.is_web));
+        assert!(outcome.results.iter().any(|r| r.is_web && !r.is_onion));
+        assert!(!outcome.results.iter().any(|r| r.is_onion));
+        assert_eq!(outcome.local_count, 1);
+        assert_eq!(outcome.web_count, 1);
+    }
+
+    #[test]
+    fn both_mode_boosts_local_results_above_equally_relevant_web_results() {
+        let mut index = Index::new();
+        // Different surrounding text (so these aren't near-duplicates and
+        // the dedup step, tested separately below, doesn't collapse them)
+        // but comparable relevance to the query term "zephyr" so BM25
+        // alone would be close to tied; the local_boost should still push
+        // the local result to rank first.
+        index_local(
+            &mut index,
+            "/notes.txt",
+            "zephyr is a lightweight configuration format for local tools",
+        );
+        index_web(
+            &mut index,
+            "https://example.com/a",
+            "A Page",
+            "zephyr is a lightweight configuration format for web services",
+        );
+
+        let outcome = parse_and_search(&index, "zephyr", SearchMode::Both);
+        assert_eq!(outcome.results.len(), 2);
+        assert!(
+            !outcome.results[0].is_web,
+            "the local result should rank first due to the hybrid local boost"
+        );
+        assert!(outcome.results[0].score > outcome.results[1].score);
+    }
+
+    #[test]
+    fn both_mode_dedupes_near_duplicate_web_result_in_favor_of_local() {
+        let mut index = Index::new();
+        let shared_text = "The definitive guide to rust ownership and borrowing semantics in depth.";
+        index_local(&mut index, "/local-copy.txt", shared_text);
+        index_web(&mut index, "https://example.com/mirror", "Mirror", shared_text);
+
+        let outcome = parse_and_search(&index, "ownership", SearchMode::Both);
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "identical content from local + web should collapse to just the local result"
+        );
+        assert!(!outcome.results[0].is_web);
+    }
+
+    #[test]
+    fn both_mode_keeps_both_when_content_is_not_actually_similar() {
+        let mut index = Index::new();
+        index_local(&mut index, "/local.txt", "rust ownership deep dive local notes");
+        index_web(
+            &mut index,
+            "https://example.com/other",
+            "Different Page",
+            "rust concurrency channels and async runtimes overview",
+        );
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Both);
+        assert_eq!(outcome.results.len(), 2, "unrelated local and web content about the same broad topic should not be deduped");
+    }
+
+    #[test]
+    fn search_mode_from_query_param_recognizes_synonyms() {
+        assert_eq!(SearchMode::from_query_param("local"), SearchMode::Local);
+        assert_eq!(SearchMode::from_query_param("PC"), SearchMode::Local);
+        assert_eq!(SearchMode::from_query_param("web"), SearchMode::Web);
+        assert_eq!(SearchMode::from_query_param("hybrid"), SearchMode::Both);
+        assert_eq!(SearchMode::from_query_param("both"), SearchMode::Both);
+        assert_eq!(SearchMode::from_query_param("tor"), SearchMode::Tor);
+        assert_eq!(SearchMode::from_query_param("onion"), SearchMode::Tor);
+        assert_eq!(SearchMode::from_query_param("nonsense"), SearchMode::Web);
+    }
+
+    #[test]
+    fn default_search_mode_is_web() {
+        assert_eq!(SearchMode::default(), SearchMode::Web);
     }
 }

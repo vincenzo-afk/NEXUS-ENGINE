@@ -4,4 +4,5 @@
 pub mod engine;
 pub mod snippet;
 
-pub use engine::search;
+#[allow(unused_imports)]
+pub use engine::{search, SearchMode, SearchOutcome};

@@ -46,6 +46,15 @@ pub struct RankingConfig {
     pub trusted_domains: HashSet<String>,
     /// Domains that receive [`spam_domain_penalty`](Self::spam_domain_penalty).
     pub spam_domains: HashSet<String>,
+    /// Multiplicative boost applied to local filesystem results in hybrid
+    /// (`SearchMode::Both`) search — local files rank slightly above web
+    /// results at the same relevance, on the theory that you indexed them
+    /// yourself and they're more likely to be exactly what you meant.
+    pub local_boost: f32,
+    /// Minimum SimHash similarity (0.0-1.0) for hybrid mode to treat a
+    /// local file and a web page as duplicate content, in which case only
+    /// the local result is kept.
+    pub hybrid_dedup_min_similarity: f32,
 }
 
 impl Default for RankingConfig {
@@ -62,6 +71,8 @@ impl Default for RankingConfig {
             click_weight: 0.15,
             trusted_domain_boost: 1.15,
             spam_domain_penalty: 0.5,
+            local_boost: 1.2,
+            hybrid_dedup_min_similarity: 0.80,
             trusted_domains: [
                 "wikipedia.org",
                 "github.com",

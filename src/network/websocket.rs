@@ -20,6 +20,9 @@ struct ClientMessage {
     msg_type: String,
     query: Option<String>,
     session_id: Option<String>,
+    /// Search mode: "local", "web", "both"/"hybrid", or "tor"/"onion".
+    /// Defaults to Web (matching the HTTP API's default) if omitted.
+    mode: Option<String>,
     #[serde(default)]
     cancel: bool,
 }
@@ -133,6 +136,11 @@ fn handle_connection(
 
         let mut current_query = query_text;
         let mut current_session = session_id;
+        let mut current_mode = client_msg
+            .mode
+            .as_deref()
+            .map(crate::search::SearchMode::from_query_param)
+            .unwrap_or_default();
 
         // Debounce: sleep 150ms between reads; if a newer message arrives, process
         // the latest one instead
@@ -151,6 +159,9 @@ fn handle_connection(
                     }
                     if let Some(s) = new_msg.session_id {
                         current_session = s;
+                    }
+                    if let Some(m) = new_msg.mode {
+                        current_mode = crate::search::SearchMode::from_query_param(&m);
                     }
                     // Continue debounce loop with the newer message
                 }
@@ -173,7 +184,8 @@ fn handle_connection(
             }
         };
 
-        let (results, _) = crate::search::search(index, &query, ranking, 0, 100, None);
+        let outcome = crate::search::search(index, &query, ranking, 0, 100, None, current_mode);
+        let results = outcome.results;
         let took_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // Always send the full current result set for this (debounced)
@@ -305,7 +317,13 @@ mod tests {
         ws.get_mut().set_read_timeout(Some(Duration::from_secs(5))).ok();
 
         // Broad query first: both rust documents should come back.
-        let broad = serde_json::json!({"type": "search", "query": "rust", "session_id": "s1"});
+        // This module is not wired up to any CLI command in this codebase
+        // (api::websocket::start_ws_server is the one `nexus serve-ws`
+        // actually calls) — kept in sync anyway since it's compiled and
+        // tested, but "both" mode is specified explicitly here since the
+        // fixture docs below are local files and this module's default
+        // mode (matching the rest of the app) is now Web.
+        let broad = serde_json::json!({"type": "search", "query": "rust", "session_id": "s1", "mode": "both"});
         ws.send(Message::Text(broad.to_string().into())).unwrap();
         let reply = read_results(&mut ws);
         assert_eq!(reply.results.len(), 2);
@@ -313,7 +331,7 @@ mod tests {
         // Narrower query in the *same session*: only one doc matches now.
         // Before the fix, this doc would have been silently dropped from
         // the response because it was already "seen" in this session.
-        let narrow = serde_json::json!({"type": "search", "query": "assembly", "session_id": "s1"});
+        let narrow = serde_json::json!({"type": "search", "query": "assembly", "session_id": "s1", "mode": "both"});
         ws.send(Message::Text(narrow.to_string().into())).unwrap();
         let reply = read_results(&mut ws);
         assert_eq!(reply.results.len(), 1, "narrowed query must still return its match, even though that doc was already sent once this session");

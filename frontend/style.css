@@ -496,6 +496,207 @@ kbd {
   padding: 0 2px;
 }
 
+/* ========== Mode Toggle ========== */
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  margin-left: 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+.mode-toggle:hover {
+  border-color: var(--mode-accent, var(--color-accent));
+}
+.mode-toggle-icon {
+  display: inline-block;
+  font-size: 1rem;
+  transition: transform 0.2s ease;
+}
+.mode-toggle.mode-switching .mode-toggle-icon {
+  transform: scale(0.6) rotate(20deg);
+  opacity: 0;
+}
+.mode-toggle-label {
+  transition: opacity 0.15s ease;
+}
+.mode-toggle.mode-switching .mode-toggle-label {
+  opacity: 0;
+}
+
+/* Per-mode accent (also drives the "focus ring" color on the search box
+   and the mode button's border, so the whole UI subtly re-tints when the
+   mode changes rather than only the one small button changing). */
+body[data-search-mode="local"] { --mode-accent: #14b8a6; }
+body[data-search-mode="web"] { --mode-accent: #0071e3; }
+body[data-search-mode="both"] { --mode-accent: #8b5cf6; }
+body[data-search-mode="tor"] { --mode-accent: #f97316; }
+
+body[data-search-mode] .mode-toggle {
+  border-color: var(--mode-accent);
+  color: var(--mode-accent);
+}
+body[data-search-mode] .search-box-wrapper:focus-within {
+  border-color: var(--mode-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mode-accent) 20%, transparent);
+}
+
+/* ========== Local-mode lock badge ========== */
+.local-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--color-text-tertiary);
+  margin-left: 6px;
+}
+
+/* ========== File type chips (Local mode) ========== */
+.filetype-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 14px;
+}
+.filetype-chips:not([hidden]) {
+  display: flex;
+}
+.chip {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.chip:hover {
+  border-color: var(--mode-accent, var(--color-accent));
+  color: var(--color-text);
+}
+.chip.chip-active {
+  background: var(--mode-accent, var(--color-accent));
+  border-color: var(--mode-accent, var(--color-accent));
+  color: #fff;
+}
+
+/* ========== Tor warning card ========== */
+.tor-warning-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid #f97316;
+  background: color-mix(in srgb, #f97316 10%, var(--color-surface));
+  text-align: left;
+}
+.tor-warning-card:not([hidden]) {
+  display: flex;
+}
+.tor-warning-icon {
+  font-size: 1.4rem;
+  flex-shrink: 0;
+}
+.tor-warning-text {
+  flex: 1;
+  font-size: 0.88rem;
+  color: var(--color-text);
+}
+.tor-warning-text code {
+  background: var(--color-surface-hover);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+.tor-warning-link {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #f97316;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.tor-warning-link:hover {
+  text-decoration: underline;
+}
+
+/* ========== Onion confirm modal ========== */
+.onion-confirm-text {
+  font-size: 0.9rem;
+  color: var(--color-text-secondary);
+  margin: 12px 0 20px;
+}
+.onion-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* ========== Result card: source badge + mode-specific actions ========== */
+.result-source-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  margin-right: 6px;
+}
+.result-favicon {
+  width: 16px;
+  height: 16px;
+  margin-right: 6px;
+  border-radius: 3px;
+  vertical-align: text-bottom;
+}
+.result-breadcrumb {
+  font-size: 0.78rem;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-mono, monospace);
+  margin-top: 2px;
+}
+.result-domain {
+  font-size: 0.8rem;
+  color: var(--color-text-tertiary);
+}
+.result-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.result-action-btn {
+  padding: 4px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  transition: all var(--transition-fast);
+}
+.result-action-btn:hover {
+  border-color: var(--mode-accent, var(--color-accent));
+  color: var(--mode-accent, var(--color-accent));
+}
+.result-card.result-card-onion .result-action-btn.result-action-visit {
+  border-color: #f97316;
+  color: #f97316;
+}
+
 /* ========== History / Saved Search Dropdowns ========== */
 .top-bar-inner {
   position: relative;

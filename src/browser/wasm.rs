@@ -68,7 +68,8 @@ impl NexusWasm {
             query::parse(query_str).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         let idx = self.index.borrow();
-        let results = search::search(&idx, &parsed, &self.ranking, 0, limit, None);
+        let outcome = search::search(&idx, &parsed, &self.ranking, 0, limit, None, search::SearchMode::Both);
+        let results = outcome.results;
 
         let output: Vec<serde_json::Value> = results
             .into_iter()

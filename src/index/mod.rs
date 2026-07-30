@@ -78,6 +78,7 @@ impl Index {
             .collect();
 
         self.inverted.index_document(doc_id, &term_pairs);
+        self.duplicates.register(doc_id, &document.content);
         self.store.insert(doc_id, document.metadata);
         debug!(
             "indexed document {} -> {:?}",

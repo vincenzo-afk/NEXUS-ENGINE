@@ -18,6 +18,9 @@ struct WsRequest {
     session_id: Option<String>,
     cancel: Option<bool>,
     limit: Option<usize>,
+    /// Search mode: "local", "web", "both"/"hybrid", or "tor"/"onion".
+    /// Defaults to Web if omitted.
+    mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +173,13 @@ pub fn handle_websocket(
             }
         };
 
-        let (raw_results, _) = crate::search::search(&index, &ast, &ranking, 0, limit, None);
+        let mode = request
+            .mode
+            .as_deref()
+            .map(crate::search::SearchMode::from_query_param)
+            .unwrap_or_default();
+        let outcome = crate::search::search(&index, &ast, &ranking, 0, limit, None, mode);
+        let raw_results = outcome.results;
 
         let terms: std::collections::HashSet<String> = crate::query::collect_terms(&ast);
 
@@ -204,7 +213,7 @@ pub fn handle_websocket(
             .collect();
 
         let took_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let total = results.len();
+        let total = outcome.total;
 
         let response = WsResponse {
             msg_type: "search_results".to_string(),

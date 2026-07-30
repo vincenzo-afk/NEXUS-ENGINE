@@ -10,6 +10,7 @@ ranked index, queryable from the CLI or over HTTP.
 $ nexus add-folder ~/projects && nexus index
 $ nexus crawl https://example.com --max-pages 500 --max-depth 4
 $ nexus search "rust AND parser site:example.com" --limit 5 --explain
+$ nexus search "rust ownership" --mode local   # local | web | both | tor
 $ nexus search "!gh nexus search engine"   # bangs redirect to the external site
 $ nexus crawl https://example.com --watch --interval 3600   # keep re-crawling on a schedule
 $ nexus serve --bind 127.0.0.1:8080   # GET /search?q=...
@@ -50,22 +51,61 @@ $ nexus privacy-policy   # Show privacy configuration
 `size>100KB`, `modified<7d`, `site:example.com`, `before:2024-01-01`, `after:2022`,
 `lang:en`, `author:jane`.
 
+### Search modes: Local / Web / Hybrid / Tor
+Every search — CLI, HTTP API, and both WebSocket servers — takes a `mode`:
+
+| Mode | What it searches | Notes |
+|---|---|---|
+| `local` | Filesystem-indexed documents only | Shows a 🔒 badge ("nothing leaves your machine"); file type filter chips (All/PDF/Markdown/Code/Docs) appear in this mode |
+| `web` (default) | Web-crawled documents only, **excluding** `.onion` addresses | Favicon, domain, title, snippet, Visit/Cache buttons |
+| `both` (hybrid) | Both, merged into one ranked list | Local results get a `local_boost` multiplier (default 1.2x); results get a 💻/🌐 badge; if a local file and a web page are ≥80% similar content (SimHash), only the local one is shown |
+| `tor` | Web-crawled documents whose URL is a `.onion` address, and **only** those | Never merged into `web` or `both` — a `.onion` link needs Tor Browser specifically, so mixing it into an ordinary result list would be confusing and a genuine accidental-click risk |
+
+`SearchMode::from_query_param` accepts a few synonyms (`fs`/`pc` for local,
+`hybrid` for both, `onion` for tor) and falls back to `web` for anything
+unrecognized. The CLI cycles through modes via `--mode`; the frontend's
+mode-toggle button cycles `local → web → both → tor → local` on click and
+re-runs the current query immediately.
+
+### `GET /open` — opening local results
+Local-mode result cards have an "Open" button that hits `GET
+/open?path=<path>`, which shells out to `xdg-open` (Linux), `open`
+(macOS), or `cmd /C start` (Windows) to open the file in its default
+application. Path-traversal protection works by *not* trying to sanitize
+an arbitrary path string (an easy category of bugs to get subtly wrong)
+— instead, `/open` and `/view/` only ever serve a path that is already
+present in the index (validated via `DocumentStore::id_for_path`). A
+request for `/open?path=../../../etc/passwd` just 404s, because that
+path was never indexed, regardless of how the traversal is encoded. (An
+earlier version of `/view/` had no such protection at all — it decoded
+and read whatever path it was given, checking only that the file
+existed. Fixed as part of this pass.)
+
 ### Search API
-`GET /search?q=...&limit=...&offset=...`, `GET /health`, and `GET /opensearch.xml`,
-served over plain HTTP (`tiny_http`), returning JSON with per-result snippets,
-scores, and (for web results) domain/title. Rate limiting is built in (token
-bucket, configurable per-IP and per-key), with query length and pagination
-depth validation.
+`GET /search?q=...&mode=...&limit=...&offset=...`, `GET /health`, `GET
+/open?path=...`, and `GET /opensearch.xml`, served over plain HTTP
+(`tiny_http`), returning JSON with per-result snippets, scores, source
+type (`is_web`/`is_onion`/`source_type`), and (for web results)
+domain/favicon. `/health` also reports whether a Tor proxy is configured
+(`tor_configured`) — a fast config check, not a live network probe;
+`nexus tor --check` does the real reachability check. Rate limiting is
+built in (token bucket, configurable per-IP and per-key), with query
+length and pagination depth validation.
 
 ### WebSocket search-as-you-type server
-A dedicated WebSocket server (`nexus serve-ws`) providing real-time search
-results as the user types. Supports debouncing (150ms coalescing), session
-tracking, and cancel messages. Sends the full current result set for each
-debounced query rather than diffing against previously-sent document IDs —
-an earlier version did the latter and had a real staleness bug where a
-document that matched an earlier, broader keystroke would never be resent
-for a later, narrower query even though it still matched. Rate limited
-through the shared token bucket.
+`nexus serve-ws` starts `api::websocket::start_ws_server` — the real,
+wired-up implementation, mode-aware like everything else. **Note:**
+there is a second, near-identical implementation at
+`network/websocket.rs` that is *not* called from anywhere in this
+codebase (verified: `WebSocketServer::start` has zero call sites outside
+its own module). It's compiled and has its own test suite, but it's dead
+code — almost certainly left over from an earlier pass that built two
+versions and only wired up one. It's kept in sync (mode support, tests
+passing) rather than silently bit-rotting, but it should be deleted or
+consolidated with `api/websocket.rs` in a follow-up; shipping two parallel
+implementations of the same server is exactly the kind of thing that
+causes a real bug fix to land in the wrong copy, which is close to what
+almost happened here.
 
 ### Bangs
 `!g rust ownership`, `rust talks !yt`, `borrow !so checker error` — a
@@ -105,14 +145,26 @@ the process itself loop rather than daemonizing, so run it under a
 process supervisor (systemd, a container restart policy, etc.) for
 unattended/restart-on-crash operation.
 
-### Frontend: search history, saved searches, export
-The bundled frontend (`frontend/`) adds three client-side-only features on
-top of the search API: a **history** panel of recent queries (click to
-re-run, persisted in `localStorage`), **saved searches** (name a query,
-including its active filters, and reload it later), and **export** buttons
-that download the currently-loaded result set as JSON or CSV. None of
-this touches the backend — it's pure client-side convenience on top of
-`GET /search`.
+### Frontend: mode toggle, search history, saved searches, export
+The bundled frontend (`frontend/`) implements the mode toggle described
+above (per-mode accent colors, an icon/label transition on switch,
+mode-specific result card layouts — breadcrumb+Open for local, favicon+
+domain+Visit/Cache for web, source badges for hybrid, an "Open a .onion
+address?" confirm modal for Tor), plus three client-side-only
+conveniences on top of the search API: a **history** panel of recent
+queries (click to re-run, persisted in `localStorage`), **saved
+searches** (name a query, including its active filters, and reload it
+later), and **export** buttons that download the currently-loaded
+result set as JSON or CSV. The history/saved/export features don't touch
+the backend at all — pure client-side convenience on top of `GET
+/search`. Bangs are detected client-side by a cheap heuristic (does the
+query contain a `!word` token) to decide whether to do a full page
+navigation instead of a `fetch()` — a real bang redirects to an
+external, cross-origin site with no CORS headers of its own, which
+`fetch()` can't read the response of, while a native browser navigation
+follows redirects transparently regardless of origin. The canonical bang
+table stays server-side only; an unrecognized `!word` just falls through
+to an ordinary search.
 
 ### Privacy & security
 - Privacy-first defaults: sponsored results blocked, filter bubble disabled,
@@ -153,7 +205,7 @@ Web (web::crawler) ────────┼──> html / formats extraction 
 | `web`          | HTTP client, robots.txt, sitemap.xml, URL canonicalization, crawl queue, crawler orchestrator |
 | `html`         | HTML content extraction (title/headings/paragraphs/meta/alt/links)     |
 | `formats`      | Markdown/JSON/XML/PDF text extraction                                  |
-| `dedup`        | Exact hashing + SimHash/shingling near-duplicate detection             |
+| `dedup`        | Exact hashing + SimHash/shingling near-duplicate detection (now applied to local files too, not just web crawls — see hybrid mode) |
 | `document`     | `Document` / `DocumentMetadata`                                        |
 | `webdoc`       | Per-page crawl metadata, link graph, PageRank                          |
 | `text`         | Unicode normalization, tokenizer, stop-words                           |
@@ -161,7 +213,7 @@ Web (web::crawler) ────────┼──> html / formats extraction 
 | `storage`      | Versioned, checksummed binary persistence + web-page content cache     |
 | `ranking`      | BM25, TF-IDF, and the composite boost formula                          |
 | `query`        | Query language: AST, lexer, recursive-descent parser                   |
-| `search`       | Query evaluation engine + best-window snippet highlighting             |
+| `search`       | Query evaluation engine, `SearchMode` (Local/Web/Hybrid/Tor) filtering, best-window snippet highlighting |
 | `clicks`       | Click-history log (ranking signal)                                     |
 | `autocomplete` | Trie-based prefix suggestions + search history                         |
 | `spellcheck`   | Levenshtein distance, "did you mean" suggestions                       |
@@ -189,7 +241,7 @@ on Linux, or the platform equivalent). Configuration sections:
 
 | Section         | Controls                                                               |
 |-----------------|------------------------------------------------------------------------|
-| `[ranking]`     | BM25 params, boost weights, trusted/spam domain lists                  |
+| `[ranking]`     | BM25 params, boost weights (incl. `local_boost`, `hybrid_dedup_min_similarity` for hybrid mode), trusted/spam domain lists |
 | `[web_crawl]`   | Crawl politeness delay, page/depth budgets, per-domain page budget, feed discovery toggle, allowed domains, etc |
 | `[privacy]`     | Sponsored result blocking, filter bubble, query anonymization, telemetry, auto-delete history |
 | `[security]`    | API key auth, TLS version, certificate pinning, CORS origins           |
@@ -205,18 +257,24 @@ with `--config` pointing at an alternate file.
 cargo test
 ```
 
-167 unit tests cover the tokenizer, query parser (including every operator,
+186 unit tests cover the tokenizer, query parser (including every operator,
 including bangs), ranking functions (including PageRank, domain quality,
-and click-history integration tests against a real `Index`), storage
-round-tripping/corruption detection, robots.txt precedence rules, sitemap
-parsing (including malformed input), RSS/Atom feed parsing (both formats,
-malformed input), URL canonicalization, the crawl queue's rate limiting
-and persistence, SimHash near-duplicate detection, HTML extraction
+and click-history integration tests against a real `Index`), the four
+`SearchMode` filters end-to-end against a real `Index` (local-only,
+web-only-excludes-onion, tor-only, hybrid merge + local boost + >80%
+cross-source dedup, dedup non-interference when content genuinely
+differs), `/open`'s path-traversal protection (rejects `..`, rejects
+paths not present in the index, rejects web-document "paths" which are
+really URLs), storage round-tripping/corruption detection, robots.txt
+precedence rules, sitemap parsing (including malformed input), RSS/Atom
+feed parsing (both formats, malformed input), URL canonicalization, the
+crawl queue's rate limiting and persistence, SimHash near-duplicate
+detection (including the register-on-reindex fix), HTML extraction
 (including noise stripping and feed-link discovery), rich-format
 extraction, the audited AEAD crypto layer (round-trip, tamper/wrong-key/
-wrong-nonce rejection), session key agreement/expiry, Tor `.onion` address
-matching, TLS config validation, and — via a real WebSocket client
-connecting to a real socket — the search-as-you-type protocol's
+wrong-nonce rejection), session key agreement/expiry, Tor `.onion`
+address matching, TLS config validation, and — via a real WebSocket
+client connecting to a real socket — the search-as-you-type protocol's
 correctness under query narrowing.
 
 The full pipeline has also been exercised end-to-end against a local HTTP
@@ -230,43 +288,70 @@ side-by-side with crawled web pages in the same index.
 ## Notes on scope
 
 This build adds a genuine, tested web crawler, HTML/rich-format extraction,
-link graph + PageRank, duplicate detection, composite ranking, expanded
-query operators, bangs, RSS/Atom feed discovery, per-domain crawl budgets,
-redirect chain tracking, a search API, a WebSocket search-as-you-type
-server, a privacy/session layer built on audited crypto primitives, and a
-frontend with history/saved-searches/export — everything listed above is
-real, integrated code with passing tests, not stubs.
+link graph + PageRank, duplicate detection (now spanning local files too),
+composite ranking, expanded query operators, bangs, RSS/Atom feed
+discovery, per-domain crawl budgets, redirect chain tracking, a search
+API, a WebSocket search-as-you-type server, a privacy/session layer built
+on audited crypto primitives, a four-mode search toggle (Local/Web/
+Hybrid/Tor) with real path-traversal-protected local file opening, and a
+frontend with history/saved-searches/export/mode-switching — everything
+listed above is real, integrated code with passing tests, not stubs.
 
-Deliberately **not** included, because building them for real (rather than
-faking them) is each its own substantial project:
+Known housekeeping item: `network/websocket.rs` is dead code (a second,
+unused WebSocket server implementation — see the WebSocket section
+above). It's kept passing its own tests rather than left to bit-rot, but
+should be deleted or merged with `api/websocket.rs`, which is the one
+actually wired to `nexus serve-ws`.
 
-- **Image search** (download/OCR/alt-text/nearby-text pipeline) and **video
-  search** (caption/subtitle indexing) — no image or video content pipeline
-  exists here at all.
-- **AI/embedding-based ranking** — the composite score is BM25 plus the
-  listed signals; no embedding model or vector index is included.
-- **True distributed search** (multiple crawler/index nodes behind a
-  distributed queue) — the queue/scheduler split is architected so a
-  multi-worker version could share it, but this build runs single-process.
-- **Personal knowledge base connectors** (Notion/Obsidian/email exports) —
-  only local files and the web are indexed; the `document`/`formats`
-  module boundary is where such connectors would plug in.
+### The larger feature wishlist
 
-On scheduling and the browser target specifically, since these were
-previously listed as unimplemented and now partly are:
-- **Crawl scheduling** is real but deliberately simple: `nexus crawl <url>
-  --watch --interval N` loops the process itself. It is not a cron
-  daemon/distributed scheduler — for unattended operation, run it under a
-  process supervisor (systemd, a container restart policy, etc.).
-- **`browser/` (WASM/IndexedDB/Web Worker)** compiles to a WASM target
-  behind the `wasm` Cargo feature (off by default; doesn't affect normal
-  native builds). It has not been exercised in this pass beyond compiling
-  — no browser-based end-to-end test was run against it, unlike the
-  native crawl/search/API pipeline, which was.
+A much longer list of "what's missing vs. Google/DDG" — headless-browser
+JS rendering, anti-bot evasion, semantic/vector search, E-E-A-T signals,
+dwell-time telemetry, instant answers/knowledge panels, image search
+(OCR), news tabs, safe search, language detection, `.onion` v3 resolution
+plus circuit isolation and identity rotation wiring, seed-list bootstrap,
+Office/PDF/email/SQLite/browser-history/EXIF indexing, OS-level deep
+search integration (Windows Search/registry, macOS Spotlight/FSEvents,
+Linux journal), file previews, tag systems, distributed sharded indexing,
+activating the WASM target as a real browser extension, index
+compression, result caching, and A/B ranking experiments — was proposed
+alongside the four-mode toggle in the same request. None of it is in this
+build. Each of those is realistically its own multi-week-to-multi-month
+project on its own (a correct headless-Chromium crawl pipeline and a
+correct OCR pipeline are not smaller undertakings than everything else in
+this repository combined), and faking any of them with code that doesn't
+actually work would be worse than not having them — a search engine that
+silently returns empty/wrong results for "OCR search" is worse than one
+that doesn't claim to support it at all.
+
+If you want to pursue any of these, the module boundaries here are built
+so they're additive rather than requiring a rewrite:
+- **Rich local file formats** (Office/PDF/email/SQLite/EXIF) plug into
+  `formats/` and `document/` the same way Markdown/JSON/XML/PDF do now —
+  add a `DocumentFormat` variant and an extractor function; `fs/crawler.rs`
+  already dispatches on extension.
+- **Semantic/vector search** would sit alongside `ranking::score_document`
+  as another signal — the composite-score architecture (multiply in a new
+  boost factor, gated by config) is exactly what would host it, the same
+  way PageRank and click-history were added.
+- **Distributed indexing** — the crawl queue/scheduler split
+  (`web::queue::CrawlQueue`) is already the seam a multi-worker version
+  would parallelize across (see its module doc comment).
+- **Browser extension** — `browser/` (WASM/IndexedDB/Web Worker, behind
+  the `wasm` Cargo feature) is the closest existing piece, but has not
+  been exercised end-to-end in a real browser in this pass — only
+  compiled. Treat it as a starting point, not a finished extension.
 - **TLS certificate pinning** (`network::tls`) validates a *desired*
   policy shape only; it is not wired into an active enforcement path in
   the HTTP client. See `PRIVACY.md` for the current, accurate scope of
   every privacy/network component.
+- **Tor circuit isolation / identity rotation** — `identity_rotation_minutes`
+  exists in config but isn't wired to anything that actually rotates a
+  circuit; `network::tor` currently configures a single static SOCKS5
+  proxy for the whole crawl.
 
-The module boundaries are designed so all of the above could be added
-without a rewrite.
+### Crawl scheduling, one more time
+`nexus crawl <url> --watch --interval N` loops the process itself. It is
+not a cron daemon/distributed scheduler — for unattended operation, run
+it under a process supervisor (systemd, a container restart policy,
+etc.).

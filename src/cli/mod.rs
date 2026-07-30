@@ -55,6 +55,10 @@ pub enum Commands {
         /// Suppress snippet generation (faster, path/score only).
         #[arg(long)]
         no_snippets: bool,
+        /// Which subset of the index to search: local, web, both (hybrid),
+        /// or tor (.onion only). Defaults to web.
+        #[arg(long, default_value = "web")]
+        mode: String,
     },
 
     /// Watch all indexed folders and apply incremental updates in real time.
