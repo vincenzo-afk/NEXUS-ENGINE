@@ -7,6 +7,8 @@ pub mod crawler;
 pub mod feed;
 pub mod http;
 pub mod queue;
+#[cfg(feature = "headless_render")]
+pub mod render;
 pub mod robots;
 pub mod sitemap;
 

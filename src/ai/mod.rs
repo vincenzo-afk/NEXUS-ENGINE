@@ -11,6 +11,7 @@
 //! the underlying search when AI isn't configured or a request fails —
 //! see [`client::LlmClient::from_config`].
 
+pub mod citation;
 pub mod client;
 pub mod rerank;
 pub mod summarize;

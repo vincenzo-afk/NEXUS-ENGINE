@@ -14,6 +14,8 @@
 
 pub mod opensearch;
 pub mod rate_limit;
+pub mod request_queue;
+pub mod result_cache;
 pub mod websocket;
 
 use crate::api::rate_limit::RateLimiter;

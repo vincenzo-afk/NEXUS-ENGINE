@@ -4,6 +4,8 @@
 //! and its extracted text content. This module also declares which file
 //! extensions Nexus knows how to read as plain text.
 
+pub mod chunking;
+
 use crate::error::{NexusError, Result};
 use crate::fs::CrawledFile;
 use log::debug;
@@ -16,7 +18,8 @@ use std::time::SystemTime;
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "txt", "md", "rs", "c", "cpp", "hpp", "h", "py", "java", "kt", "js", "ts", "tsx", "jsx",
     "html", "htm", "css", "json", "xml", "yaml", "yml", "toml", "csv", "log", "sh", "go", "rb",
-    "pdf",
+    "pdf", "docx", "xlsx", "pptx", "eml", "mbox", "zip", "sqlite", "sqlite3", "db", "jpg",
+    "jpeg", "png", "tiff", "tif", "webp", "heic",
 ];
 
 /// A unique, stable identifier assigned to each indexed document.
@@ -104,6 +107,42 @@ impl Document {
             crate::formats::DocumentFormat::PlainText => {
                 let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
                 String::from_utf8_lossy(&bytes).into_owned()
+            }
+            crate::formats::DocumentFormat::Docx => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::office::extract_docx(&bytes).text
+            }
+            crate::formats::DocumentFormat::Xlsx => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::office::extract_xlsx(&bytes).text
+            }
+            crate::formats::DocumentFormat::Pptx => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::office::extract_pptx(&bytes).text
+            }
+            crate::formats::DocumentFormat::Eml => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::email::parse_eml(&bytes)
+                    .map(|e| e.indexable_text())
+                    .unwrap_or_default()
+            }
+            crate::formats::DocumentFormat::Mbox => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::email::parse_mbox(&bytes)
+                    .iter()
+                    .map(|e| e.indexable_text())
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n")
+            }
+            crate::formats::DocumentFormat::Zip => {
+                let bytes = std::fs::read(&file.path).map_err(|e| NexusError::io(&file.path, e))?;
+                crate::extract::archive::extract_zip(&bytes).text
+            }
+            crate::formats::DocumentFormat::SqliteDb => {
+                crate::extract::sqlite_notes::extract_text(&file.path).text
+            }
+            crate::formats::DocumentFormat::Image => {
+                crate::extract::image_ocr::extract_image_text(&file.path).text
             }
         };
 

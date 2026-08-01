@@ -61,6 +61,52 @@ Nexus includes an optional privacy/networking layer for crawling privately:
   active certificate-pinning enforcement path in the HTTP client. Don't
   rely on it as an active security control until that's implemented.
 
+## Newer, privacy-sensitive local extractors and features
+
+A few additions since the sections above were written carry their own
+privacy considerations worth calling out explicitly rather than leaving
+implicit:
+
+- **Browser history indexing** (`extract::browser_history`): reads
+  Chromium/Firefox history database files if you point an indexed folder
+  at one. Browser history is unusually sensitive — it can reveal health
+  conditions, relationships, job searches, and more, far beyond what a
+  folder of documents typically would. Nexus only indexes what you
+  explicitly add to `indexed_folders`; it does not search for or
+  auto-discover browser profile directories on its own. If you index a
+  history file, treat query access to that index with the same care you
+  would treat direct access to the browser's history itself.
+- **Email indexing** (`extract::email`): `.eml`/`.mbox` files are indexed
+  the same as any other local file you explicitly add — subject, sender/
+  recipient, and body text all become searchable text, and attachment
+  *names* (not contents) are included. As with any local file, this data
+  never leaves your machine unless you've configured the optional AI
+  features (see below) or expose the search API beyond localhost.
+- **Image OCR** (`extract::image_ocr`): if a system `tesseract` binary is
+  installed, image files you index have their visible text extracted and
+  made searchable — useful for scanned documents and screenshots, but
+  worth knowing if you index a folder containing photos with incidental
+  text in them (a photographed whiteboard, a screenshot with a phone
+  number visible, etc.) that you hadn't thought of as "text you're
+  indexing."
+- **Permission-aware hybrid search** (`entity::Acl`/`entity::HybridRanker`):
+  a deny-by-default access-control model for merging results from
+  different sources. This is a library-level component, not yet wired
+  into `api::mod`'s actual request handling — until it is, the API layer
+  described above (no accounts, no per-user profiles) remains the
+  accurate description of what's actually enforced at the API. Don't
+  treat `entity::Acl` as an active security boundary until it's
+  integrated end-to-end and that integration has been reviewed.
+- **Online metrics** (`metrics::SearchEventLog`): if wired up, records
+  per-session query/click events (query text, timestamps, clicked
+  document IDs, dwell time) to compute the aggregate rates described in
+  the README. This is exactly the kind of per-session log
+  `anonymize_queries`/`disable_telemetry` are meant to govern — any
+  integration of `SearchEventLog` into the API layer should respect
+  those existing settings (e.g. not persisting session-linked events
+  when `anonymize_queries` is enabled), which is not automatic just
+  because the struct exists.
+
 ## Reporting a concern
 
 This is an open-source project; if you find a privacy or security issue,

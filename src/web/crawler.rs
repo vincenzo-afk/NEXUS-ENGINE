@@ -325,6 +325,89 @@ impl WebCrawler {
                         None,
                         Vec::new(),
                     ),
+                    DocumentFormat::Docx => (
+                        crate::extract::office::extract_docx(&response.bytes).text,
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Xlsx => (
+                        crate::extract::office::extract_xlsx(&response.bytes).text,
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Pptx => (
+                        crate::extract::office::extract_pptx(&response.bytes).text,
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Eml => (
+                        crate::extract::email::parse_eml(&response.bytes)
+                            .map(|e| e.indexable_text())
+                            .unwrap_or_default(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Mbox => (
+                        crate::extract::email::parse_mbox(&response.bytes)
+                            .iter()
+                            .map(|e| e.indexable_text())
+                            .collect::<Vec<_>>()
+                            .join("\n\n---\n\n"),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Zip => (
+                        crate::extract::archive::extract_zip(&response.bytes).text,
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    // A crawled SQLite file over HTTP has no on-disk path for
+                    // `crate::extract::sqlite_notes` to open (it needs a
+                    // real file, not an in-memory byte buffer) — treated as
+                    // an opaque download rather than something to extract
+                    // text from mid-crawl.
+                    DocumentFormat::SqliteDb => (
+                        String::new(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    DocumentFormat::Image => (
+                        extract_image_bytes_via_temp_file(&response.bytes),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
                 };
 
             if indexable_text.trim().is_empty() {
@@ -620,4 +703,25 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// `crate::extract::image_ocr` operates on a filesystem path (both EXIF
+/// reading and shelling out to `tesseract` expect one), but a crawled
+/// image only exists as an in-memory byte buffer — this bridges the two
+/// by writing to a short-lived temp file, extracting, and cleaning up
+/// immediately after, rather than changing the extractor's interface
+/// (which local-file callers use directly with a real path already) to
+/// awkwardly support both.
+fn extract_image_bytes_via_temp_file(bytes: &[u8]) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "nexus-crawled-image-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    if std::fs::write(&path, bytes).is_err() {
+        return String::new();
+    }
+    let text = crate::extract::image_ocr::extract_image_text(&path).text;
+    std::fs::remove_file(&path).ok();
+    text
 }

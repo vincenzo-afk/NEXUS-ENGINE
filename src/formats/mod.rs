@@ -24,6 +24,23 @@ pub enum DocumentFormat {
     Xml,
     /// PDF: extracted via `pdf-extract`.
     Pdf,
+    /// Word document (`.docx`), via `crate::extract::office`.
+    Docx,
+    /// Excel workbook (`.xlsx`), via `crate::extract::office`.
+    Xlsx,
+    /// PowerPoint deck (`.pptx`), via `crate::extract::office`.
+    Pptx,
+    /// Single email message (`.eml`), via `crate::extract::email`.
+    Eml,
+    /// Multi-message mailbox (`.mbox`), via `crate::extract::email`.
+    Mbox,
+    /// Generic zip archive, via `crate::extract::archive`.
+    Zip,
+    /// SQLite database file of unknown/app-specific schema (note stores),
+    /// via `crate::extract::sqlite_notes`.
+    SqliteDb,
+    /// Raster image: EXIF + optional OCR, via `crate::extract::image_ocr`.
+    Image,
 }
 
 impl DocumentFormat {
@@ -35,6 +52,14 @@ impl DocumentFormat {
             "json" => DocumentFormat::Json,
             "xml" => DocumentFormat::Xml,
             "pdf" => DocumentFormat::Pdf,
+            "docx" => DocumentFormat::Docx,
+            "xlsx" => DocumentFormat::Xlsx,
+            "pptx" => DocumentFormat::Pptx,
+            "eml" => DocumentFormat::Eml,
+            "mbox" => DocumentFormat::Mbox,
+            "zip" => DocumentFormat::Zip,
+            "sqlite" | "sqlite3" | "db" => DocumentFormat::SqliteDb,
+            "jpg" | "jpeg" | "png" | "tiff" | "tif" | "webp" | "heic" => DocumentFormat::Image,
             _ => DocumentFormat::PlainText,
         }
     }
@@ -55,6 +80,21 @@ impl DocumentFormat {
                 DocumentFormat::Xml
             }
             "application/pdf" => DocumentFormat::Pdf,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+                DocumentFormat::Docx
+            }
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+                DocumentFormat::Xlsx
+            }
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+                DocumentFormat::Pptx
+            }
+            "message/rfc822" => DocumentFormat::Eml,
+            "application/mbox" => DocumentFormat::Mbox,
+            "application/zip" | "application/x-zip-compressed" => DocumentFormat::Zip,
+            "image/jpeg" | "image/png" | "image/tiff" | "image/webp" | "image/heic" => {
+                DocumentFormat::Image
+            }
             _ => DocumentFormat::PlainText,
         }
     }
@@ -68,6 +108,14 @@ impl DocumentFormat {
             DocumentFormat::Json => "json",
             DocumentFormat::Xml => "xml",
             DocumentFormat::Pdf => "pdf",
+            DocumentFormat::Docx => "docx",
+            DocumentFormat::Xlsx => "xlsx",
+            DocumentFormat::Pptx => "pptx",
+            DocumentFormat::Eml => "eml",
+            DocumentFormat::Mbox => "mbox",
+            DocumentFormat::Zip => "zip",
+            DocumentFormat::SqliteDb => "sqlite",
+            DocumentFormat::Image => "image",
         }
     }
 }

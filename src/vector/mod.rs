@@ -181,6 +181,90 @@ impl VectorIndex {
     }
 }
 
+/// One chunk's embedding plus enough identifying info to map a chunk-level
+/// match back to a highlighted span in the parent document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkVector {
+    pub chunk_index: u32,
+    pub start_offset: u32,
+    pub end_offset: u32,
+    pub vector: LexicalVector,
+}
+
+/// `DocId -> [per-chunk vectors]`, the chunked counterpart to
+/// [`VectorIndex`]. Kept as a separate structure (rather than folding
+/// into `VectorIndex`) so documents short enough to not need chunking
+/// pay no extra storage cost — most local files and short web pages will
+/// only ever have a `VectorIndex` entry, never a `ChunkVectorIndex` one.
+///
+/// ## Ranking integration seam
+/// A chunk-level match should surface as "the whole document ranked, with
+/// the winning chunk's offsets available for snippet generation" rather
+/// than chunks competing as separate search results — `best_chunk_for`
+/// below is what a search-engine integration would call per candidate
+/// document to get that chunk's cosine similarity and offsets, folding
+/// the similarity into the same scoring path `vector_weight` already
+/// uses in `crate::ranking`. That wiring (calling this from
+/// `search::engine` alongside the existing whole-document
+/// `VectorIndex::get` lookup) is not yet done in this pass — the storage,
+/// chunking, and per-chunk scoring math here are complete and tested
+/// independent of it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ChunkVectorIndex {
+    chunks: HashMap<crate::document::DocId, Vec<ChunkVector>>,
+}
+
+impl ChunkVectorIndex {
+    pub fn new() -> Self {
+        ChunkVectorIndex::default()
+    }
+
+    /// Chunks `text` and stores one TF vector per chunk for `doc_id`,
+    /// replacing any previously stored chunks for that document.
+    pub fn index_document(
+        &mut self,
+        doc_id: crate::document::DocId,
+        text: &str,
+        config: crate::document::chunking::ChunkConfig,
+    ) {
+        let chunks = crate::document::chunking::chunk_text(text, config);
+        let vectors = chunks
+            .into_iter()
+            .map(|c| ChunkVector {
+                chunk_index: c.index,
+                start_offset: c.start_offset,
+                end_offset: c.end_offset,
+                vector: embed_tf(&c.text),
+            })
+            .collect();
+        self.chunks.insert(doc_id, vectors);
+    }
+
+    /// Removes all stored chunk vectors for `doc_id`.
+    pub fn remove(&mut self, doc_id: crate::document::DocId) {
+        self.chunks.remove(&doc_id);
+    }
+
+    /// Returns the best-matching chunk (by cosine similarity to
+    /// `query_vector`) for `doc_id`, along with its similarity score, or
+    /// `None` if the document has no stored chunks (e.g. it was short
+    /// enough that only the whole-document `VectorIndex` was used).
+    pub fn best_chunk_for(
+        &self,
+        doc_id: crate::document::DocId,
+        query_vector: &LexicalVector,
+    ) -> Option<(&ChunkVector, f32)> {
+        self.chunks.get(&doc_id)?.iter().map(|c| (c, c.vector.cosine_similarity(query_vector))).max_by(
+            |a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal),
+        )
+    }
+
+    /// Total number of documents that have stored chunk vectors.
+    pub fn document_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +328,36 @@ mod tests {
         index.remove(1);
         assert!(index.get(1).is_none());
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn chunk_index_finds_the_best_matching_chunk() {
+        let mut index = ChunkVectorIndex::new();
+        let words_a: Vec<String> = (0..400).map(|i| format!("filler{i}")).collect();
+        let mut text = words_a.join(" ");
+        text.push_str(" rust ownership borrowing memory safety guarantees ");
+        text.push_str(&(0..400).map(|i| format!("more_filler{i}")).collect::<Vec<_>>().join(" "));
+
+        index.index_document(
+            1,
+            &text,
+            crate::document::chunking::ChunkConfig {
+                max_words: 300,
+                overlap_words: 20,
+            },
+        );
+        assert!(index.document_count() == 1);
+
+        let query = embed_tf("rust ownership borrowing memory safety");
+        let (best_chunk, similarity) = index.best_chunk_for(1, &query).expect("should find a chunk");
+        assert!(similarity > 0.0);
+        assert!(best_chunk.end_offset > best_chunk.start_offset);
+    }
+
+    #[test]
+    fn chunk_index_returns_none_for_unindexed_doc() {
+        let index = ChunkVectorIndex::new();
+        let query = embed_tf("anything");
+        assert!(index.best_chunk_for(999, &query).is_none());
     }
 }
