@@ -54,6 +54,16 @@ struct ApiResult {
     size: String,
     date: String,
     filetype: String,
+    /// One-line summary of the non-baseline ranking signals that applied,
+    /// e.g. "Title / filename match (+50%), Authority (+12%)".
+    why: String,
+    /// The full structured breakdown behind `why`, for a "why did this
+    /// rank here?" expandable panel.
+    explanation: Vec<crate::ranking::ExplanationReason>,
+    /// Reliability signals (web results only — see the module doc
+    /// comment on `ranking::reliability` for exactly what this is and
+    /// isn't).
+    reliability: Option<crate::ranking::reliability::ReliabilitySignals>,
 }
 
 /// The full JSON response for `GET /search`.
@@ -72,6 +82,12 @@ struct ApiResponse {
     results: Vec<ApiResult>,
     #[serde(rename = "hasMore")]
     has_more: bool,
+    /// `true` if `?rerank=1` was requested AND AI reranking actually
+    /// succeeded and was applied. `false` if reranking wasn't requested,
+    /// AI isn't configured, or the AI's response couldn't be validated
+    /// (in which case results are in their normal ranked order, not a
+    /// broken partial rerank).
+    ai_reranked: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,7 +402,7 @@ fn handle_request(
                 return;
             }
 
-            let response = run_search(index, content_cache, ranking, &q, offset, limit, &params);
+            let response = run_search(index, content_cache, ranking, &config.ai, &q, offset, limit, &params);
             let mut http_response = match response {
                 Ok(body) => {
                     Response::from_string(serde_json::to_string(&body).unwrap_or_default())
@@ -405,6 +421,42 @@ fn handle_request(
             if !config.security.cors_allowed_origins.is_empty() {
                 http_response = http_response.with_header(cors_header);
             }
+            let _ = request.respond(http_response);
+        }
+        "/ask" => {
+            if !rate_limiter.consume(client_ip, 1) {
+                let body = serde_json::to_string(&ApiError {
+                    error: "rate limit exceeded, please slow down".to_string(),
+                })
+                .unwrap_or_default();
+                let _ = request.respond(
+                    Response::from_string(body).with_status_code(429).with_header(json_header),
+                );
+                return;
+            }
+
+            let params = parse_query_string(query);
+            let q = params.get("q").cloned().unwrap_or_default();
+            if q.trim().is_empty() {
+                let body = serde_json::to_string(&ApiError {
+                    error: "missing required query parameter 'q'".to_string(),
+                })
+                .unwrap_or_default();
+                let _ = request.respond(
+                    Response::from_string(body).with_status_code(400).with_header(json_header),
+                );
+                return;
+            }
+
+            let response = run_ask(index, content_cache, ranking, &config.ai, &q, &params);
+            let http_response = match response {
+                Ok(body) => Response::from_string(serde_json::to_string(&body).unwrap_or_default())
+                    .with_header(json_header),
+                Err(e) => {
+                    let body = serde_json::to_string(&ApiError { error: e.to_string() }).unwrap_or_default();
+                    Response::from_string(body).with_status_code(503).with_header(json_header)
+                }
+            };
             let _ = request.respond(http_response);
         }
         path if path.starts_with("/view/") => {
@@ -531,6 +583,7 @@ fn run_search(
     index: &Index,
     content_cache: &ContentCache,
     ranking: &crate::config::RankingConfig,
+    ai_config: &crate::config::AiConfig,
     query_str: &str,
     offset: usize,
     limit: usize,
@@ -581,11 +634,46 @@ fn run_search(
         .unwrap_or_default();
 
     let outcome = search::search(index, &combined_ast, ranking, offset, limit, None, mode);
-    let (results, total, local_count, web_count) =
+    let (mut results, total, local_count, web_count) =
         (outcome.results, outcome.total, outcome.local_count, outcome.web_count);
-    let took_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let took_ms_pre_rerank = started.elapsed().as_secs_f64() * 1000.0;
 
     let terms: HashSet<String> = crate::query::collect_terms(&combined_ast);
+
+    let rerank_requested = params.get("rerank").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let mut ai_reranked = false;
+    if rerank_requested {
+        if let Ok(Some(client)) = crate::ai::LlmClient::from_config(ai_config) {
+            let candidates: Vec<crate::ai::RerankCandidate> = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let web_meta = index.web.get(r.doc_id);
+                    let content = match web_meta {
+                        Some(_) => content_cache.load(r.doc_id).ok(),
+                        None => std::fs::read_to_string(&r.path).ok(),
+                    };
+                    let snippet = content
+                        .as_deref()
+                        .map(|c| snippet::generate_from_content(c, &terms).text)
+                        .unwrap_or_default();
+                    crate::ai::RerankCandidate { id: i, title: r.file_name.clone(), snippet }
+                })
+                .collect();
+
+            if let Ok(order) = crate::ai::rerank(&client, query_str, &candidates) {
+                let original = std::mem::take(&mut results);
+                results = order.into_iter().map(|i| original[i].clone()).collect();
+                ai_reranked = true;
+            }
+            // On any rerank error (network failure, malformed response),
+            // `results` is left in its original order — reranking is a
+            // best-effort enhancement, never a hard requirement for
+            // search to return results.
+        }
+    }
+    let took_ms = if rerank_requested { started.elapsed().as_secs_f64() * 1000.0 } else { took_ms_pre_rerank };
+
     let results = results
         .into_iter()
         .enumerate()
@@ -618,6 +706,10 @@ fn run_search(
                 format!("https://www.google.com/s2/favicons?domain={}", m.domain)
             });
 
+            let reliability = web_meta.map(|m| {
+                crate::ranking::reliability::compute(m, m.in_degree(), index.web.len(), ranking)
+            });
+
             ApiResult {
                 rank: offset + i + 1,
                 url,
@@ -634,6 +726,9 @@ fn run_search(
                 size: size_str,
                 date: date_str,
                 filetype: extension,
+                why: r.explanation.summary_line(),
+                reliability,
+                explanation: r.explanation.reasons(),
             }
         })
         .collect::<Vec<_>>();
@@ -649,6 +744,138 @@ fn run_search(
         took_ms,
         results,
         has_more,
+        ai_reranked,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct AskSource {
+    id: usize,
+    title: String,
+    url: String,
+    cited: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AskResponse {
+    query: String,
+    answer: String,
+    sources: Vec<AskSource>,
+    ungrounded_sentences_dropped: usize,
+    ai_reranked: bool,
+    took_ms: f64,
+}
+
+/// Handles `GET /ask`: retrieves candidates the same way `/search` does,
+/// optionally reranks them, then asks the configured LLM for a
+/// citation-grounded summary. Returns `Err` (surfaced as HTTP 503, "AI
+/// unavailable" rather than "your search is broken") if AI isn't
+/// configured or the LLM call itself fails — a missing/failed AI feature
+/// should never look like a generic server error.
+fn run_ask(
+    index: &Index,
+    content_cache: &ContentCache,
+    ranking: &crate::config::RankingConfig,
+    ai_config: &crate::config::AiConfig,
+    query_str: &str,
+    params: &HashMap<String, String>,
+) -> Result<AskResponse> {
+    let started = std::time::Instant::now();
+
+    let Some(client) = crate::ai::LlmClient::from_config(ai_config)? else {
+        return Err(crate::error::NexusError::Other(
+            "AI features aren't configured on this server (set [ai] enabled = true and api_key in config.toml)".to_string(),
+        ));
+    };
+
+    let mode = params
+        .get("mode")
+        .map(|s| search::SearchMode::from_query_param(s))
+        .unwrap_or_default();
+    let use_rerank = params.get("rerank").map(|v| v == "1" || v == "true").unwrap_or(false);
+
+    let ast = crate::query::parse(query_str)?;
+    let candidate_limit = ai_config.rerank_top_n.max(ai_config.summary_max_sources);
+    let outcome = search::search(index, &ast, ranking, 0, candidate_limit, None, mode);
+
+    if outcome.results.is_empty() {
+        return Ok(AskResponse {
+            query: query_str.to_string(),
+            answer: String::new(),
+            sources: Vec::new(),
+            ungrounded_sentences_dropped: 0,
+            ai_reranked: false,
+            took_ms: started.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    let terms: HashSet<String> = crate::query::collect_terms(&ast);
+    let load_content = |r: &search::engine::SearchResult| -> Option<String> {
+        if index.web.get(r.doc_id).is_some() {
+            content_cache.load(r.doc_id).ok()
+        } else {
+            std::fs::read_to_string(&r.path).ok()
+        }
+    };
+
+    let mut ordered: Vec<&search::engine::SearchResult> = outcome.results.iter().collect();
+    let mut ai_reranked = false;
+
+    if use_rerank {
+        let candidates: Vec<crate::ai::RerankCandidate> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let snippet = load_content(r)
+                    .as_deref()
+                    .map(|c| snippet::generate_from_content(c, &terms).text)
+                    .unwrap_or_default();
+                crate::ai::RerankCandidate { id: i, title: r.file_name.clone(), snippet }
+            })
+            .collect();
+        if let Ok(order) = crate::ai::rerank(&client, query_str, &candidates) {
+            ordered = order.into_iter().map(|i| ordered[i]).collect();
+            ai_reranked = true;
+        }
+    }
+
+    let sources: Vec<crate::ai::SummarySource> = ordered
+        .iter()
+        .take(ai_config.summary_max_sources)
+        .enumerate()
+        .map(|(i, r)| {
+            let snippet = load_content(r)
+                .as_deref()
+                .map(|c| snippet::generate_from_content(c, &terms).text)
+                .unwrap_or_default();
+            crate::ai::SummarySource {
+                id: i + 1,
+                title: r.file_name.clone(),
+                snippet,
+                url_or_path: r.path.to_string_lossy().to_string(),
+            }
+        })
+        .collect();
+
+    let summary = crate::ai::summarize(&client, query_str, &sources)?;
+
+    let ask_sources = sources
+        .iter()
+        .map(|s| AskSource {
+            id: s.id,
+            title: s.title.clone(),
+            url: s.url_or_path.clone(),
+            cited: summary.cited_source_ids.contains(&s.id),
+        })
+        .collect();
+
+    Ok(AskResponse {
+        query: query_str.to_string(),
+        answer: summary.text,
+        sources: ask_sources,
+        ungrounded_sentences_dropped: summary.ungrounded_sentences_dropped,
+        ai_reranked,
+        took_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
 }
 

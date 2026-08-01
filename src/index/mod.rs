@@ -12,6 +12,7 @@ use crate::document::{DocId, Document};
 use crate::index::inverted::InvertedIndex;
 use crate::index::store::DocumentStore;
 use crate::index::vocabulary::{TermId, Vocabulary};
+use crate::vector::VectorIndex;
 use crate::webdoc::WebMetaStore;
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -22,9 +23,11 @@ use std::path::Path;
 ///
 /// v2 added `web`, the per-page crawl/link-graph metadata store, and
 /// `duplicates`, the near-duplicate detection index, to support web
-/// crawling. Index files written by v1 (filesystem-only) builds are not
-/// forward compatible; run `nexus rebuild` after upgrading.
-pub const INDEX_FORMAT_VERSION: u32 = 2;
+/// crawling. v3 added `vectors`, the per-document lexical hashing-trick
+/// vector used for hybrid BM25 + vector re-ranking. Index files written
+/// by earlier builds are not forward compatible; run `nexus rebuild`
+/// after upgrading.
+pub const INDEX_FORMAT_VERSION: u32 = 3;
 
 /// The complete, persistable search index.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -44,6 +47,12 @@ pub struct Index {
     /// indexed twice.
     #[serde(default)]
     pub duplicates: DuplicateIndex,
+    /// Per-document lexical hashing-trick vectors, used to complement
+    /// BM25 with a second, differently-shaped similarity signal (see
+    /// `crate::vector`'s module doc comment for exactly what this is —
+    /// and isn't).
+    #[serde(default)]
+    pub vectors: VectorIndex,
 }
 
 impl Index {
@@ -55,6 +64,7 @@ impl Index {
             store: DocumentStore::new(),
             web: WebMetaStore::new(),
             duplicates: DuplicateIndex::new(),
+            vectors: VectorIndex::new(),
         }
     }
 
@@ -79,6 +89,7 @@ impl Index {
 
         self.inverted.index_document(doc_id, &term_pairs);
         self.duplicates.register(doc_id, &document.content);
+        self.vectors.set(doc_id, crate::vector::embed_tf(&document.content));
         self.store.insert(doc_id, document.metadata);
         debug!(
             "indexed document {} -> {:?}",
@@ -99,6 +110,7 @@ impl Index {
             self.inverted.remove_document(doc_id, meta.token_count);
             self.web.remove(doc_id);
             self.duplicates.remove(doc_id);
+            self.vectors.remove(doc_id);
             true
         } else {
             false

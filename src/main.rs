@@ -13,6 +13,8 @@
 
 mod api;
 mod bangs;
+mod vector;
+mod ai;
 mod autocomplete;
 mod browser;
 mod cli;

@@ -1,5 +1,7 @@
 pub mod api;
 pub mod bangs;
+pub mod vector;
+pub mod ai;
 pub mod autocomplete;
 pub mod browser;
 pub mod cli;

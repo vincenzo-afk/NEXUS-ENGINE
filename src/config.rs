@@ -55,6 +55,12 @@ pub struct RankingConfig {
     /// local file and a web page as duplicate content, in which case only
     /// the local result is kept.
     pub hybrid_dedup_min_similarity: f32,
+    /// How strongly the lexical vector similarity signal (see
+    /// `crate::vector`) influences ranking:
+    /// `final *= 1.0 + vector_weight * cosine_similarity.max(0.0)`.
+    /// `0.0` disables it entirely (pure BM25 + the other signals, as
+    /// before this feature existed).
+    pub vector_weight: f32,
 }
 
 impl Default for RankingConfig {
@@ -73,6 +79,7 @@ impl Default for RankingConfig {
             spam_domain_penalty: 0.5,
             local_boost: 1.2,
             hybrid_dedup_min_similarity: 0.80,
+            vector_weight: 0.4,
             trusted_domains: [
                 "wikipedia.org",
                 "github.com",
@@ -263,6 +270,51 @@ impl Default for TorProxyConfig {
     }
 }
 
+/// Configuration for optional AI reranking and citation-grounded
+/// summarization, via a user-configured OpenAI-compatible chat
+/// completions endpoint (`{api_base_url}/chat/completions`). This works
+/// with OpenAI itself, and with any self-hosted OpenAI-compatible server
+/// (Ollama, LM Studio, vLLM, LocalAI, etc.) by pointing `api_base_url` at
+/// it — Nexus does not bundle, download, or call out to any specific AI
+/// provider on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Master switch. When `false` (the default), `crate::ai` never makes
+    /// a network request, regardless of any other setting here.
+    pub enabled: bool,
+    /// Base URL of an OpenAI-compatible API, without a trailing slash.
+    pub api_base_url: String,
+    /// API key sent as `Authorization: Bearer {api_key}`. Required (in
+    /// addition to `enabled`) for any AI feature to actually run — an
+    /// empty key means "not configured," not "use some default."
+    pub api_key: String,
+    /// Model name to request, e.g. `"gpt-4o-mini"` or a self-hosted
+    /// server's model identifier.
+    pub model: String,
+    /// How many of the top BM25+vector-ranked candidates to send to the
+    /// reranker. Larger values cost more tokens/latency per search.
+    pub rerank_top_n: usize,
+    /// How many top-ranked results to feed as sources for `nexus ask` /
+    /// `GET /ask` summarization.
+    pub summary_max_sources: usize,
+    /// Per-request timeout for calls to the configured LLM endpoint.
+    pub timeout_seconds: u64,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        AiConfig {
+            enabled: false,
+            api_base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".to_string(),
+            rerank_top_n: 20,
+            summary_max_sources: 5,
+            timeout_seconds: 20,
+        }
+    }
+}
+
 /// Top-level Nexus configuration, serialized to `~/.config/nexus/config.toml`
 /// (or platform equivalent) unless a custom path is supplied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +346,11 @@ pub struct Config {
     /// Tor proxy configuration.
     #[serde(default)]
     pub tor: TorProxyConfig,
+    /// Optional AI reranking/summarization configuration. Disabled by
+    /// default — nothing in `crate::ai` runs, and no request is ever sent
+    /// to any LLM endpoint, unless `enabled = true` and `api_key` is set.
+    #[serde(default)]
+    pub ai: AiConfig,
     /// Size, in entries, of the in-memory search-result cache.
     pub cache_size: usize,
     /// Number of worker threads used for crawling/indexing. `0` means "use
@@ -346,6 +403,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             websocket: WebSocketConfig::default(),
             tor: TorProxyConfig::default(),
+            ai: AiConfig::default(),
             cache_size: 256,
             thread_count: 0,
             index_path: default_index_path(),

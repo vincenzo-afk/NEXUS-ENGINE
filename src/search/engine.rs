@@ -123,6 +123,13 @@ pub fn search(
     let matches = evaluate(query, index);
     let now_unix = chrono::Utc::now().timestamp();
 
+    let query_terms = crate::query::collect_terms(query);
+    let query_vec = if config.vector_weight > 0.0 {
+        crate::vector::query_vector(index, &query_terms)
+    } else {
+        None
+    };
+
     let mut results: Vec<SearchResult> = matches
         .into_iter()
         .filter_map(|(doc_id, mut match_info)| {
@@ -185,6 +192,15 @@ pub fn search(
 
             if mode == SearchMode::Both && !is_web {
                 explanation.final_score *= config.local_boost;
+            }
+
+            if let Some(qv) = &query_vec {
+                if let Some(doc_vec) = index.vectors.get(doc_id) {
+                    let similarity = qv.cosine_similarity(doc_vec).max(0.0);
+                    let vector_boost = 1.0 + config.vector_weight * similarity;
+                    explanation.vector_boost = vector_boost;
+                    explanation.final_score *= vector_boost;
+                }
             }
 
             Some(SearchResult {
@@ -837,5 +853,50 @@ mod tests {
     #[test]
     fn default_search_mode_is_web() {
         assert_eq!(SearchMode::default(), SearchMode::Web);
+    }
+
+    #[test]
+    fn vector_similarity_reranks_within_the_bm25_matched_set() {
+        let mut index = Index::new();
+        // Both documents match "rust" exactly once, so their BM25 scores
+        // are close/identical — but doc B's surrounding vocabulary
+        // overlaps far more with the query's other implied context
+        // (through the shared "ownership"/"borrowing"/"memory" terms),
+        // so its lexical vector should be more similar to the query.
+        let doc_a = index_local(
+            &mut index,
+            "/a.txt",
+            "rust is a popular choice for game development and web assembly targets",
+        );
+        let doc_b = index_local(
+            &mut index,
+            "/b.txt",
+            "rust enforces ownership and borrowing rules for memory safety at compile time",
+        );
+
+        let ast = crate::query::parse("rust OR ownership OR borrowing OR memory OR safety").unwrap();
+        let mut config = crate::config::RankingConfig::default();
+        config.vector_weight = 2.0; // exaggerate the signal so the test isn't flaky
+        let outcome = search(&index, &ast, &config, 0, 50, None, SearchMode::Both);
+
+        let a_result = outcome.results.iter().find(|r| r.doc_id == doc_a).unwrap();
+        let b_result = outcome.results.iter().find(|r| r.doc_id == doc_b).unwrap();
+        assert!(
+            b_result.explanation.vector_boost > a_result.explanation.vector_boost,
+            "doc B's content is more similar to the full query context and should get a larger vector boost"
+        );
+    }
+
+    #[test]
+    fn vector_weight_zero_disables_the_signal_entirely() {
+        let mut index = Index::new();
+        index_local(&mut index, "/a.txt", "rust ownership borrowing memory safety deep dive");
+
+        let ast = crate::query::parse("rust ownership").unwrap();
+        let mut config = crate::config::RankingConfig::default();
+        config.vector_weight = 0.0;
+        let outcome = search(&index, &ast, &config, 0, 50, None, SearchMode::Both);
+
+        assert_eq!(outcome.results[0].explanation.vector_boost, 1.0);
     }
 }

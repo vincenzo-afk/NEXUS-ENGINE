@@ -9,6 +9,7 @@
 //! graph), so filesystem-only searches behave exactly as before.
 
 pub mod bm25;
+pub mod reliability;
 pub mod tfidf;
 
 use log::debug;
@@ -44,8 +45,135 @@ pub struct ScoreExplanation {
     /// Multiplier derived from how often this result has been clicked
     /// historically.
     pub click_boost: f32,
+    /// Multiplier from the lexical vector similarity signal (see
+    /// `crate::vector`) — `1.0` if vector retrieval found no similarity
+    /// beyond what BM25 already captured, or if this document has no
+    /// stored vector.
+    pub vector_boost: f32,
     /// Final score: the product of every boost above times `bm25_score`.
     pub final_score: f32,
+}
+
+/// One human-readable reason contributing to a result's rank, as returned
+/// by [`ScoreExplanation::reasons`]. This is the data behind "explainable
+/// ranking" — surfaced via `--explain` in the CLI and an `explanation`
+/// field in the API response, rather than hidden the way most search
+/// engines keep ranking signals opaque.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplanationReason {
+    /// Short label for the signal, e.g. "Exact phrase match".
+    pub label: String,
+    /// How much this signal changed the score, as a percentage
+    /// (`+50.0` for a 1.5x boost, `-20.0` for a 0.8x penalty). `0.0` for
+    /// the baseline BM25 entry, which isn't a multiplier.
+    pub impact_percent: f32,
+    /// A plain-language sentence explaining the signal.
+    pub detail: String,
+}
+
+impl ScoreExplanation {
+    /// Builds a human-readable breakdown of why this document scored the
+    /// way it did. Only includes signals that actually moved the score
+    /// (multiplier != 1.0), plus the baseline BM25 relevance entry, so
+    /// the result is a short, genuinely informative list rather than
+    /// always showing all eight possible signals including no-ops.
+    pub fn reasons(&self) -> Vec<ExplanationReason> {
+        let mut reasons = vec![ExplanationReason {
+            label: "Keyword relevance (BM25)".to_string(),
+            impact_percent: 0.0,
+            detail: format!(
+                "Base text-match score of {:.2} from how well your search terms matched the document's content — this is the foundation every other signal below adjusts.",
+                self.bm25_score
+            ),
+        }];
+
+        let mut push = |label: &str, boost: f32, detail: String| {
+            if (boost - 1.0).abs() > 0.001 {
+                reasons.push(ExplanationReason {
+                    label: label.to_string(),
+                    impact_percent: (boost - 1.0) * 100.0,
+                    detail,
+                });
+            }
+        };
+
+        push(
+            "Title / filename match",
+            self.filename_boost,
+            "Your search terms appear in the page title or file name, which is a stronger relevance signal than appearing only in the body.".to_string(),
+        );
+        push(
+            "Exact phrase match",
+            self.exact_match_boost,
+            "Your search terms matched as an exact, contiguous phrase rather than scattered individual words.".to_string(),
+        );
+        if self.recency_boost > 1.0 {
+            push(
+                "Recency",
+                self.recency_boost,
+                "This document was modified or crawled recently.".to_string(),
+            );
+        }
+        if self.pagerank_boost > 1.0 {
+            push(
+                "Authority (PageRank)",
+                self.pagerank_boost,
+                "Other pages in the index link to this one, which PageRank treats as a vote of relevance/trust from the rest of the crawled web graph.".to_string(),
+            );
+        }
+        push(
+            "URL match",
+            self.url_match_boost,
+            "Your search terms appear directly in the page's URL.".to_string(),
+        );
+        if self.domain_quality_boost > 1.0 {
+            push(
+                "Trusted domain",
+                self.domain_quality_boost,
+                "This page's domain is on the configured trusted-domain list.".to_string(),
+            );
+        } else if self.domain_quality_boost < 1.0 {
+            push(
+                "Low-quality domain",
+                self.domain_quality_boost,
+                "This page's domain is on the configured spam/low-quality domain list, which penalizes it rather than excluding it outright.".to_string(),
+            );
+        }
+        if self.click_boost > 1.0 {
+            push(
+                "Click history",
+                self.click_boost,
+                "Other searches have resulted in this document being clicked before, which this engine treats as a signal it was actually useful.".to_string(),
+            );
+        }
+        if self.vector_boost > 1.0 {
+            push(
+                "Content similarity (vector)",
+                self.vector_boost,
+                "This document's overall word distribution is similar to your query beyond just the exact term matches BM25 already counted — see the vector-retrieval scope notes for what this does and doesn't mean (it's lexical similarity, not synonym/meaning understanding).".to_string(),
+            );
+        }
+
+        reasons
+    }
+
+    /// A single-line summary listing every non-baseline reason, e.g.
+    /// `"Exact phrase match (+50%), Authority (+12%), Trusted domain (+15%)"`.
+    /// Returns `"Matched your search terms"` if no boost signal applied
+    /// beyond plain keyword relevance.
+    pub fn summary_line(&self) -> String {
+        let boosts: Vec<String> = self
+            .reasons()
+            .iter()
+            .skip(1) // skip the baseline BM25 entry
+            .map(|r| format!("{} ({:+.0}%)", r.label, r.impact_percent))
+            .collect();
+        if boosts.is_empty() {
+            "Matched your search terms".to_string()
+        } else {
+            boosts.join(", ")
+        }
+    }
 }
 
 /// Per-document intermediate data the ranker needs: which terms matched and
@@ -168,6 +296,7 @@ pub fn score_document(
         url_match_boost,
         domain_quality_boost,
         click_boost,
+        vector_boost: 1.0,
         final_score,
     })
 }
@@ -271,5 +400,86 @@ mod integration_tests {
         let with_clicks =
             score_document(&index, doc_id, &match_info, &config, 0, Some(&clicks)).unwrap();
         assert!(with_clicks.final_score > no_clicks.final_score);
+    }
+
+    #[test]
+    fn reasons_always_includes_baseline_bm25() {
+        let explanation = ScoreExplanation {
+            bm25_score: 3.5,
+            filename_boost: 1.0,
+            exact_match_boost: 1.0,
+            recency_boost: 1.0,
+            pagerank_boost: 1.0,
+            url_match_boost: 1.0,
+            domain_quality_boost: 1.0,
+            click_boost: 1.0,
+            vector_boost: 1.0,
+            final_score: 3.5,
+        };
+        let reasons = explanation.reasons();
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].label, "Keyword relevance (BM25)");
+        assert_eq!(reasons[0].impact_percent, 0.0);
+        assert_eq!(explanation.summary_line(), "Matched your search terms");
+    }
+
+    #[test]
+    fn reasons_only_lists_non_neutral_signals() {
+        let explanation = ScoreExplanation {
+            bm25_score: 3.5,
+            filename_boost: 2.0,   // +100%
+            exact_match_boost: 1.0, // neutral, excluded
+            recency_boost: 1.0,
+            pagerank_boost: 1.5,   // +50%
+            url_match_boost: 1.0,
+            domain_quality_boost: 1.0,
+            click_boost: 1.0,
+            vector_boost: 1.0,
+            final_score: 10.5,
+        };
+        let reasons = explanation.reasons();
+        // baseline + filename + pagerank = 3
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons.iter().any(|r| r.label == "Title / filename match" && (r.impact_percent - 100.0).abs() < 0.01));
+        assert!(reasons.iter().any(|r| r.label == "Authority (PageRank)" && (r.impact_percent - 50.0).abs() < 0.01));
+        assert!(!reasons.iter().any(|r| r.label == "Exact phrase match"));
+    }
+
+    #[test]
+    fn low_quality_domain_boost_is_labeled_as_a_penalty() {
+        let explanation = ScoreExplanation {
+            bm25_score: 3.5,
+            filename_boost: 1.0,
+            exact_match_boost: 1.0,
+            recency_boost: 1.0,
+            pagerank_boost: 1.0,
+            url_match_boost: 1.0,
+            domain_quality_boost: 0.5, // -50%
+            click_boost: 1.0,
+            vector_boost: 1.0,
+            final_score: 1.75,
+        };
+        let reasons = explanation.reasons();
+        let domain_reason = reasons.iter().find(|r| r.label == "Low-quality domain").unwrap();
+        assert!((domain_reason.impact_percent - (-50.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn summary_line_joins_multiple_boosts_readably() {
+        let explanation = ScoreExplanation {
+            bm25_score: 3.5,
+            filename_boost: 1.5,
+            exact_match_boost: 1.0,
+            recency_boost: 1.0,
+            pagerank_boost: 1.2,
+            url_match_boost: 1.0,
+            domain_quality_boost: 1.0,
+            click_boost: 1.0,
+            vector_boost: 1.0,
+            final_score: 6.3,
+        };
+        let summary = explanation.summary_line();
+        assert!(summary.contains("Title / filename match (+50%)"));
+        assert!(summary.contains("Authority (PageRank) (+20%)"));
     }
 }

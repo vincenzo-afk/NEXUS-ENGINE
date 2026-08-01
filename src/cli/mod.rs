@@ -157,6 +157,22 @@ pub enum Commands {
         bind: String,
     },
 
+    /// Answer a question with an AI-generated, citation-grounded summary
+    /// of the top search results. Requires `[ai] enabled = true` and
+    /// `api_key` configured (see `nexus config`) — otherwise this prints
+    /// an explanation and exits rather than failing confusingly.
+    Ask {
+        /// The question to answer.
+        query: String,
+        /// Which subset of the index to draw sources from.
+        #[arg(long, default_value = "web")]
+        mode: String,
+        /// Also apply AI reranking to the candidate results before
+        /// selecting sources for the summary.
+        #[arg(long)]
+        rerank: bool,
+    },
+
     /// Start the WebSocket search-as-you-type server.
     ServeWs {
         /// Address to bind to.

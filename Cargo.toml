@@ -42,7 +42,7 @@ chrono = { version = "0.4", features = ["serde"] }
 crc32fast = "1.3"
 regex = "1.10"
 indexmap = "=2.2.6"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls", "socks"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls", "socks", "json"] }
 url = { version = "=2.4.1", features = ["serde"] }
 scraper = "0.18"
 quick-xml = "0.31"

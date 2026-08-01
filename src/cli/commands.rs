@@ -107,6 +107,7 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
         Commands::Pagerank => cmd_pagerank(&config),
         Commands::Click { query, rank } => cmd_click(&config, &query, rank),
         Commands::Serve { bind } => cmd_serve(&config, &bind),
+        Commands::Ask { query, mode, rerank } => cmd_ask(&config, &query, &mode, rerank),
         Commands::ServeWs { bind } => cmd_serve_ws(&config, &bind),
         Commands::Tor {
             enable,
@@ -322,17 +323,18 @@ fn cmd_search(
         }
 
         if explain {
-            println!(
-                "   explain: bm25={:.3} filename/title={:.2} exact={:.2} recency={:.2} pagerank={:.2} url={:.2} domain={:.2} clicks={:.2}",
-                result.explanation.bm25_score,
-                result.explanation.filename_boost,
-                result.explanation.exact_match_boost,
-                result.explanation.recency_boost,
-                result.explanation.pagerank_boost,
-                result.explanation.url_match_boost,
-                result.explanation.domain_quality_boost,
-                result.explanation.click_boost,
-            );
+            println!("   why this ranked here:");
+            for reason in result.explanation.reasons() {
+                if reason.impact_percent == 0.0 {
+                    println!("     - {}: {}", reason.label, reason.detail);
+                } else {
+                    println!(
+                        "     - {} ({:+.0}%): {}",
+                        reason.label, reason.impact_percent, reason.detail
+                    );
+                }
+            }
+            println!("     final score: {:.3}", result.explanation.final_score);
         }
         println!();
     }
@@ -862,6 +864,130 @@ fn cmd_serve(config: &Config, bind: &str) -> Result<()> {
     info!("starting HTTP server on {}", bind);
     let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
     crate::api::serve(bind, config, rate_limiter)
+}
+
+fn cmd_ask(config: &Config, query_str: &str, mode_str: &str, use_rerank: bool) -> Result<()> {
+    let Some(client) = crate::ai::LlmClient::from_config(&config.ai)? else {
+        println!("AI features aren't configured.");
+        println!("Set [ai] enabled = true and api_key = \"...\" in your config.toml to use `nexus ask`.");
+        println!("(config file: run `nexus config` to see its path)");
+        println!();
+        println!("This works with OpenAI directly, or any self-hosted OpenAI-compatible server");
+        println!("(Ollama, LM Studio, vLLM, LocalAI, ...) by pointing api_base_url at it.");
+        return Ok(());
+    };
+
+    let index = load_index(config)?;
+    if index.document_count() == 0 {
+        println!("index is empty; run `nexus index <folder>` or `nexus crawl <url>` first");
+        return Ok(());
+    }
+
+    let mode = crate::search::SearchMode::from_query_param(mode_str);
+    let ast = query::parse(query_str)?;
+    let candidate_limit = config.ai.rerank_top_n.max(config.ai.summary_max_sources);
+    let outcome = crate::search::search(&index, &ast, &config.ranking, 0, candidate_limit, None, mode);
+
+    if outcome.results.is_empty() {
+        println!("no results for '{}' — nothing to summarize.", query_str);
+        return Ok(());
+    }
+
+    let content_cache = ContentCache::new(config.content_cache_dir.clone());
+    let terms: HashSet<String> = query::collect_terms(&ast);
+
+    // Build snippets for every candidate once, up front, since both
+    // reranking and summarization need title+snippet text.
+    let mut ordered: Vec<&crate::search::engine::SearchResult> = outcome.results.iter().collect();
+
+    if use_rerank {
+        let candidates: Vec<crate::ai::RerankCandidate> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let content = load_result_content(&index, &content_cache, r);
+                let snippet = content
+                    .as_deref()
+                    .map(|c| snippet::generate_from_content(c, &terms).text)
+                    .unwrap_or_default();
+                crate::ai::RerankCandidate { id: i, title: r.file_name.clone(), snippet }
+            })
+            .collect();
+
+        match crate::ai::rerank(&client, query_str, &candidates) {
+            Ok(order) => {
+                let reranked: Vec<&crate::search::engine::SearchResult> =
+                    order.iter().map(|&i| ordered[i]).collect();
+                ordered = reranked;
+                println!("(AI reranking applied)\n");
+            }
+            Err(e) => {
+                warn!("AI reranking failed, keeping original order: {}", e);
+                println!("(AI reranking failed — {} — showing normally-ranked results)\n", e);
+            }
+        }
+    }
+
+    let sources: Vec<crate::ai::SummarySource> = ordered
+        .iter()
+        .take(config.ai.summary_max_sources)
+        .enumerate()
+        .map(|(i, r)| {
+            let content = load_result_content(&index, &content_cache, r);
+            let snippet = content
+                .as_deref()
+                .map(|c| snippet::generate_from_content(c, &terms).text)
+                .unwrap_or_default();
+            crate::ai::SummarySource {
+                id: i + 1,
+                title: r.file_name.clone(),
+                snippet,
+                url_or_path: r.path.to_string_lossy().to_string(),
+            }
+        })
+        .collect();
+
+    println!("Answering from {} source(s)...\n", sources.len());
+    let summary = crate::ai::summarize(&client, query_str, &sources)?;
+
+    if summary.text.is_empty() {
+        println!("The AI couldn't produce a grounded answer from these sources (every candidate");
+        println!("sentence lacked a valid citation). Try `nexus search` instead, or rephrase.");
+        return Ok(());
+    }
+
+    println!("{}\n", summary.text);
+    if summary.ungrounded_sentences_dropped > 0 {
+        println!(
+            "(note: {} ungrounded sentence(s) from the AI's response were dropped for lacking a valid citation)\n",
+            summary.ungrounded_sentences_dropped
+        );
+    }
+
+    println!("Sources:");
+    for source in &sources {
+        let cited_marker = if summary.cited_source_ids.contains(&source.id) { "" } else { " (not cited)" };
+        println!("  [{}] {}{}", source.id, source.url_or_path, cited_marker);
+    }
+
+    Ok(())
+}
+
+/// Loads a result's full content for summarization/reranking: from the
+/// content cache for web results, or by re-reading the file for local
+/// results. Returns `None` (rather than erroring the whole command) if
+/// the content can't be loaded, so one unreadable source doesn't break
+/// `ask` for every other source.
+fn load_result_content(
+    index: &Index,
+    content_cache: &ContentCache,
+    result: &crate::search::engine::SearchResult,
+) -> Option<String> {
+    if index.web.get(result.doc_id).is_some() {
+        content_cache.load(result.doc_id).ok()
+    } else {
+        std::fs::read_to_string(&result.path).ok()
+    }
 }
 
 fn cmd_serve_ws(config: &Config, bind: &str) -> Result<()> {
