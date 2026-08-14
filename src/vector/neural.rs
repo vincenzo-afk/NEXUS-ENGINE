@@ -223,6 +223,10 @@ mod tests {
     fn load_reports_a_clear_error_for_a_missing_model_directory() {
         let result = NeuralEmbedder::load(Path::new("/no/such/model/dir"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("config.json"));
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("load unexpectedly succeeded"),
+        };
+        assert!(err.contains("config.json"));
     }
 }

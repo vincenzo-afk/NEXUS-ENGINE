@@ -118,6 +118,22 @@ pub fn resolve(base: &Url, href: &str) -> Option<Url> {
     Some(canonicalize(&resolved))
 }
 
+/// Builds a fetch-safe origin string for a URL, keeping the port whenever
+/// it isn't the scheme's well-known default (80 for http, 443 for https).
+/// Used wherever the crawler has to *fetch* something — robots.txt,
+/// sitemaps, feed well-known paths — because stripping a non-default
+/// port from the origin (e.g. turning `http://127.0.0.1:8899` into
+/// `http://127.0.0.1`) silently points requests at the wrong server.
+/// `domain_of` deliberately stays port-less since rate-limit buckets and
+/// per-domain budgets are keyed by registrable domain, not origin.
+pub fn origin_of(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port_or_known_default() {
+        Some(80) | Some(443) | None => format!("{}://{}", url.scheme(), host),
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+    }
+}
+
 /// Returns the registrable "domain" used for per-domain rate limiting and
 /// domain-quality scoring: the host, without a leading `www.`.
 pub fn domain_of(url: &Url) -> String {
@@ -168,6 +184,22 @@ mod tests {
         );
         assert!(resolve(&base, "mailto:a@b.com").is_none());
         assert!(resolve(&base, "javascript:void(0)").is_none());
+    }
+
+    #[test]
+    fn origin_keeps_non_default_port() {
+        let url = Url::parse("http://127.0.0.1:8899/index.html").unwrap();
+        assert_eq!(origin_of(&url), "http://127.0.0.1:8899");
+        let secure = Url::parse("https://example.com:8443/x").unwrap();
+        assert_eq!(origin_of(&secure), "https://example.com:8443");
+    }
+
+    #[test]
+    fn origin_drops_default_port() {
+        let url = Url::parse("http://example.com:80/a").unwrap();
+        assert_eq!(origin_of(&url), "http://example.com");
+        let url = Url::parse("https://example.com:443/a").unwrap();
+        assert_eq!(origin_of(&url), "https://example.com");
     }
 
     #[test]

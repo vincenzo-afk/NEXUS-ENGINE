@@ -26,10 +26,12 @@
 //!   has no such dependency and always works on images that carry EXIF.
 
 pub mod archive;
+#[cfg(feature = "sqlite")]
 pub mod browser_history;
 pub mod email;
 pub mod image_ocr;
 pub mod office;
+#[cfg(feature = "sqlite")]
 pub mod sqlite_notes;
 
 /// Result of extracting indexable text (and, where applicable, structured

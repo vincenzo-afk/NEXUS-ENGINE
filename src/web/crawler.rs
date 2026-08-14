@@ -591,11 +591,7 @@ impl WebCrawler {
         }
 
         let sitemap_urls: Vec<String> = if robots.sitemaps.is_empty() {
-            vec![format!(
-                "{}://{}/sitemap.xml",
-                url.scheme(),
-                url.host_str().unwrap_or("")
-            )]
+            vec![format!("{}/sitemap.xml", canonical::origin_of(url))]
         } else {
             robots.sitemaps.clone()
         };
@@ -610,7 +606,7 @@ impl WebCrawler {
         }
 
         if self.config.discover_feeds {
-            let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+            let origin = canonical::origin_of(url);
             for well_known in ["/feed", "/feed.xml", "/rss.xml", "/atom.xml", "/rss"] {
                 let feed_url = format!("{origin}{well_known}");
                 self.discover_and_enqueue_feed(&feed_url, queue, report);
@@ -702,7 +698,7 @@ impl WebCrawler {
     }
 
     fn robots_for(&mut self, url: &Url) -> RobotsTxt {
-        let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+        let origin = canonical::origin_of(url);
         if let Some(cached) = self.robots_cache.get(&origin) {
             return cached.clone();
         }

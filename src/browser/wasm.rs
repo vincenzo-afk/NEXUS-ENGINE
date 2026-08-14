@@ -50,6 +50,9 @@ impl NexusWasm {
             size_bytes: content.len() as u64,
             modified_unix: chrono::Utc::now().timestamp(),
             token_count: 0,
+            // In-browser documents have no file-system ACL; everything is
+            // public to the session that created the index.
+            acl: crate::entity::Acl::public(),
         };
 
         let doc = Document {

@@ -189,7 +189,15 @@ impl Document {
                 crate::extract::archive::extract_zip(&bytes).text
             }
             crate::formats::DocumentFormat::SqliteDb => {
-                crate::extract::sqlite_notes::extract_text(&file.path).text
+                #[cfg(feature = "sqlite")]
+                {
+                    crate::extract::sqlite_notes::extract_text(&file.path).text
+                }
+                #[cfg(not(feature = "sqlite"))]
+                {
+                    let _ = &file.path;
+                    String::new()
+                }
             }
             crate::formats::DocumentFormat::Image => {
                 crate::extract::image_ocr::extract_image_text(&file.path).text
