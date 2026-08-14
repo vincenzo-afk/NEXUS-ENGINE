@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
+use js_sys::{Function, Object, Promise as JsPromise, Reflect};
 
 use crate::autocomplete::Autocomplete;
 use crate::config::RankingConfig;
@@ -187,4 +188,95 @@ impl NexusWasm {
         };
         wasm_bindgen_futures::future_to_promise(future)
     }
+
+    /// Set the remote Nexus API base URL used by [`Self::web_search`].
+    /// `url` is the *base* URL of a running Nexus `nexus serve` instance,
+    /// e.g. `https://search.example.com` — it must expose the standard
+    /// `GET /search?q=...&limit=...&offset=...` endpoint. Call this once
+    /// before `web_search`; without it, `web_search` rejects the query.
+    pub fn set_search_endpoint(&self, url: &str) {
+        SEARCH_ENDPOINT.with(|ep| {
+            *ep.borrow_mut() = Some(url.trim_end_matches('/').to_string());
+        });
+    }
+
+    /// Search the live web (or any remote Nexus index) through a running
+    /// Nexus API server pointed at by [`Self::set_search_endpoint`]. The
+    /// browser build cannot crawl or host its own index, so this is how
+    /// the WASM build "actually searches sites": it delegates the query
+    /// to a real Nexus instance over `fetch()` and returns the same
+    /// result JSON the `GET /search` API endpoint returns.
+    ///
+    /// Returns a `Promise<JSON>` resolving to the API's `ApiResponse`
+    /// object (`{total, results: [{title, url, snippet, score, ...}], ...}`),
+    /// or rejecting with an error string on network/parse failure.
+    pub fn web_search(&self, query_str: &str, limit: usize) -> js_sys::Promise {
+        let query = query_str.to_string();
+        let endpoint = SEARCH_ENDPOINT.with(|ep| ep.borrow().clone());
+
+        let future = async move {
+            let base = endpoint.ok_or_else(|| {
+                JsValue::from_str(
+                    "web_search endpoint not set — call set_search_endpoint(url) first",
+                )
+            })?;
+
+            let url = format!(
+                "{}/search?q={}&limit={}&offset=0",
+                base,
+                urlencoding::encode(&query),
+                limit.max(1)
+            );
+
+            let window = js_sys::global();
+            let fetch_fn: Function = Reflect::get(&window, &JsValue::from_str("fetch"))
+                .map_err(|_| JsValue::from_str("fetch() is not available in this environment"))?
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("fetch is not a function"))?;
+
+            let promise: JsPromise = fetch_fn
+                .call1(&JsValue::NULL, &JsValue::from_str(&url))
+                .map_err(|e| JsValue::from_str(&format!("fetch() threw: {:?}", e)))?
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("fetch did not return a Promise"))?;
+            let response = JsFuture::from(promise)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("network request failed: {:?}", e)))?;
+
+            // response.json() — untyped Reflect calls so no web-sys
+            // feature list fights us.
+            let json_promise: JsPromise = Reflect::get(&response, &JsValue::from_str("json"))
+                .map_err(|_| JsValue::from_str("response has no .json()"))?
+                .dyn_into::<Function>()
+                .map_err(|_| JsValue::from_str("response.json is not a function"))?
+                .call0(&response)
+                .map_err(|e| JsValue::from_str(&format!("response.json() threw: {:?}", e)))?
+                .dyn_into()
+                .map_err(|_| JsValue::from_str("response.json did not return a Promise"))?;
+            let parsed = JsFuture::from(json_promise)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("failed to parse response JSON: {:?}", e)))?;
+
+            // Validate it looks like a real API response (has `results`).
+            if Reflect::get(&parsed, &JsValue::from_str("results")).is_err() {
+                return Err(JsValue::from_str(
+                    "server response is missing the `results` field — is the endpoint a Nexus API?",
+                ));
+            }
+            // Wrap in an envelope so consumers always see the same shape.
+            let envelope = Object::new();
+            let _ = Reflect::set(&envelope, &JsValue::from_str("query"), &JsValue::from_str(&query));
+            let _ = Reflect::set(&envelope, &JsValue::from_str("endpoint"), &JsValue::from_str(&base));
+            let _ = Reflect::set(&envelope, &JsValue::from_str("results"), &Reflect::get(&parsed, &JsValue::from_str("results")).unwrap_or(JsValue::UNDEFINED));
+            let _ = Reflect::set(&envelope, &JsValue::from_str("total"), &Reflect::get(&parsed, &JsValue::from_str("total")).unwrap_or_else(|_| JsValue::from_f64(0.0)));
+            let _ = Reflect::set(&envelope, &JsValue::from_str("raw"), &parsed);
+            Ok(JsValue::from(envelope))
+        };
+
+        wasm_bindgen_futures::future_to_promise(future)
+    }
+}
+
+thread_local! {
+    static SEARCH_ENDPOINT: RefCell<Option<String>> = RefCell::new(None);
 }

@@ -128,7 +128,10 @@ pub struct SearchOutcome {
     /// card needs, e.g. `"12 km to miles"` after parsing no longer
     /// obviously reads as a conversion request). `None` doesn't mean "no
     /// results," it means "not that kind of query" — always fall through
-    /// to `results` regardless.
+    /// to `results` regardless. Instant answers run on the server only
+    /// (they live in `crate::answers`), so this field is absent from the
+    /// WASM build.
+    #[cfg(not(target_family = "wasm"))]
     pub instant_answer: Option<crate::answers::InstantAnswer>,
     /// The combined local + federated result list, only populated by
     /// [`search_with_federation`] when federation is actually enabled
@@ -136,6 +139,9 @@ pub struct SearchOutcome {
     /// stays this instance's own local view regardless. `None` doesn't
     /// mean "no federated results," it means "federation wasn't run for
     /// this search" (disabled, or called via plain [`search_query`]).
+    /// Federation is a server-only feature (real outbound HTTP to peers),
+    /// so this field is absent from the WASM build.
+    #[cfg(not(target_family = "wasm"))]
     pub federated_results: Option<Vec<crate::entity::UnifiedEntity>>,
 }
 
@@ -433,7 +439,9 @@ pub fn search(
         total,
         local_count,
         web_count,
+        #[cfg(not(target_family = "wasm"))]
         instant_answer: None,
+        #[cfg(not(target_family = "wasm"))]
         federated_results: None,
     }
 }
@@ -465,12 +473,19 @@ pub fn search_query(
     if let Some(p) = personalization {
         apply_personal_boost(&mut outcome.results, index, p);
     }
-    outcome.instant_answer = crate::answers::try_answer(raw_query);
+    #[cfg(not(target_family = "wasm"))]
+    {
+        outcome.instant_answer = crate::answers::try_answer(raw_query);
+    }
     Ok(outcome)
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Runs [`search_query`], then — if `federation_config.enabled` and at
 /// least one peer is configured — fans out to every enabled peer via
+///
+/// WASM builds cannot perform outbound federation (no sockets/HTTP
+/// client), so this function is not available on `wasm32`.
 /// [`crate::federation::FederatedSearchClient`], merges each peer's
 /// results with this instance's own local results through the same
 /// real [`crate::entity::HybridRanker::merge`] used for local/web

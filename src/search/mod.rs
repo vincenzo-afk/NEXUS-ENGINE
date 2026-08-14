@@ -6,6 +6,10 @@ pub mod snippet;
 
 #[allow(unused_imports)]
 pub use engine::{
-    apply_personal_boost, compute_result_features, search, search_query, search_with_federation,
+    apply_personal_boost, compute_result_features, search, search_query,
     Personalization, SearchMode, SearchOutcome,
 };
+// Federation runs on the server only (real outbound HTTP to peers).
+#[cfg(not(target_family = "wasm"))]
+#[allow(unused_imports)]
+pub use engine::search_with_federation;

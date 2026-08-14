@@ -406,12 +406,18 @@ pub struct Config {
     /// true` and at least one peer is configured. See
     /// `crate::federation`'s module doc comment for exactly what this
     /// does and doesn't implement.
+    /// Federation is a server-only feature (real outbound HTTP to peers),
+    /// so this field is absent from the WASM build.
     #[serde(default)]
+    #[cfg(not(target_family = "wasm"))]
     pub federation: FederationConfig,
 }
 
-/// Federated search configuration. See [`crate::federation`].
+/// Federated search configuration. Federation is a server-only feature
+/// (real outbound HTTP to peers), so this struct is absent from the WASM
+/// build. See [`crate::federation`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(not(target_family = "wasm"))]
 pub struct FederationConfig {
     /// Master switch — `false` means federation never runs, regardless
     /// of `peers`, so a peer list can be configured ahead of time
@@ -423,6 +429,7 @@ pub struct FederationConfig {
     pub per_peer_timeout_ms: u64,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Default for FederationConfig {
     fn default() -> Self {
         FederationConfig {
@@ -473,6 +480,7 @@ impl Default for Config {
             personal_model_path: default_personal_model_path(),
             last_search_path: default_last_search_path(),
             crawl_queue_path: default_queue_path(),
+            #[cfg(not(target_family = "wasm"))]
             federation: FederationConfig::default(),
         }
     }

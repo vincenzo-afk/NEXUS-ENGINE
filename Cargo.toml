@@ -13,8 +13,11 @@ path = "src/main.rs"
 [lib]
 name = "nexus"
 path = "src/lib.rs"
-crate-type = ["rlib"]
-# WASM builds additionally require cdylib (add via --cfg when targeting wasm32)
+crate-type = ["rlib", "cdylib"]
+# cdylib is required so `cargo build --target wasm32-unknown-unknown` emits
+# `target/wasm32-unknown-unknown/release/nexus.wasm`. On other targets it
+# harmlessly also emits a shared library alongside the rlib (and the
+# binary build is unaffected).
 
 [profile.release]
 opt-level = 3
