@@ -1,0 +1,13 @@
+/target/
+
+# Local editor and operating-system files
+.DS_Store
+*.swp
+*.swo
+
+# Local secrets and machine-specific overrides
+.env
+.env.*
+!.env.example
+*.key
+*.pem

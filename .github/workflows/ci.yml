@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Native tests and WASM build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Run native tests
+        run: cargo test --all-targets
+      - name: Build browser WASM library
+        run: cargo build --lib --release --target wasm32-unknown-unknown --features wasm
+      - name: Verify WASM artifact
+        run: test -s target/wasm32-unknown-unknown/release/nexus.wasm

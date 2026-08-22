@@ -36,7 +36,7 @@ fn wrap_request(request: &JsValue) -> js_sys::Promise {
                 .and_then(|t: JsValue| js_sys::Reflect::get(&t, &JsValue::from_str("error")).ok())
                 .map(|err| format!("{:?}", err))
                 .unwrap_or_else(|| "IndexedDB request error".to_string());
-            reject.call1(&JsValue::NULL, &JsValue::from_str(&msg));
+            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str(&msg));
         }) as Box<dyn FnMut(_)>);
         let _ = js_sys::Reflect::set(&req, &JsValue::from_str("onerror"), err_cb.as_ref());
         err_cb.forget();
@@ -145,7 +145,10 @@ fn open(db_name: &str, store_name: &str) -> js_sys::Promise {
                 .ok()
                 .map(|e| format!("{:?}", e))
                 .unwrap_or_default();
-            reject.call1(&JsValue::NULL, &JsValue::from_str(&format!("{} {}", msg, detail)));
+            let _ = reject.call1(
+                &JsValue::NULL,
+                &JsValue::from_str(&format!("{} {}", msg, detail)),
+            );
         }) as Box<dyn FnMut(_)>);
         let _ = js_sys::Reflect::set(&request, &JsValue::from_str("onerror"), err_cb.as_ref());
         err_cb.forget();
