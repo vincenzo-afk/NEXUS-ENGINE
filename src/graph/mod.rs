@@ -32,7 +32,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A document can contain thousands of identifier-shaped tokens, but a
+/// co-occurrence graph has one potential edge for every pair of entities.
+/// Limiting the source set keeps a pathological/generated source from
+/// turning the otherwise useful graph into a quadratic memory allocation.
+const MAX_ENTITIES_PER_SOURCE: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EntityKind {
     /// A capitalized multi-word or single-word proper-noun-shaped mention
     /// not otherwise classified — covers both people and organizations,
@@ -217,11 +223,16 @@ impl GraphBuilder {
     /// first (or use [`GraphBuilder::reingest`]) if the source's
     /// previous mentions need to be replaced rather than added to.
     pub fn ingest(&mut self, source_id: &str, text: &str, timestamp_unix: i64) {
-        let mentions_here: Vec<(String, EntityKind)> = extract_entities(text)
+        let mut mentions_here: Vec<(String, EntityKind)> = extract_entities(text)
             .into_iter()
             .collect::<HashSet<_>>() // de-dup within this one document
             .into_iter()
             .collect();
+
+        // HashSet iteration is deliberately unspecified. Sorting gives the
+        // cap a deterministic, reproducible meaning and keeps the persisted
+        // graph stable across repeated indexing of the same source.
+        mentions_here.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         for (name, kind) in &mentions_here {
             let entity = self.entities.entry(name.clone()).or_insert_with(|| Entity {
@@ -236,9 +247,10 @@ impl GraphBuilder {
         }
 
         let pairs_for_source = self.source_pairs.entry(source_id.to_string()).or_default();
-        for i in 0..mentions_here.len() {
-            for j in (i + 1)..mentions_here.len() {
-                let (a, b) = (&mentions_here[i].0, &mentions_here[j].0);
+        let co_occurrence_entities = &mentions_here[..mentions_here.len().min(MAX_ENTITIES_PER_SOURCE)];
+        for i in 0..co_occurrence_entities.len() {
+            for j in (i + 1)..co_occurrence_entities.len() {
+                let (a, b) = (&co_occurrence_entities[i].0, &co_occurrence_entities[j].0);
                 let key = if a < b {
                     (a.clone(), b.clone())
                 } else {
@@ -566,5 +578,22 @@ mod tests {
         assert!(index.graph.entity("John Smith").is_none());
         assert!(index.graph.entity("Acme Corporation").is_none());
         assert_eq!(index.graph.entity("Sarah Chen").unwrap().mention_count(), 1);
+    }
+
+    #[test]
+    fn caps_entities_per_source_before_building_quadratic_co_occurrences() {
+        let mut graph = GraphBuilder::new();
+        let text = (0..(MAX_ENTITIES_PER_SOURCE * 4))
+            .map(|i| format!("identifier_{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        graph.ingest("generated-source", &text, 1);
+
+        assert_eq!(graph.entity_count(), MAX_ENTITIES_PER_SOURCE * 4);
+        let pairs = graph.source_pairs.get("generated-source").expect("source pairs stored");
+        assert_eq!(pairs.len(), MAX_ENTITIES_PER_SOURCE * (MAX_ENTITIES_PER_SOURCE - 1) / 2);
+        assert!(graph.entity("identifier_0").is_some());
+        assert!(graph.entity(&format!("identifier_{}", MAX_ENTITIES_PER_SOURCE * 4 - 1)).is_some());
     }
 }
