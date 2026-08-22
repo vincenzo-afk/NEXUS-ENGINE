@@ -39,3 +39,8 @@
 - [x] Key WebSocket message rate limits to the peer IP rather than a random session so reconnecting cannot reset the client bucket; focused reconnect-stability regression passes.
 - [x] Enforce `websocket.max_connections`: the listener now atomically rejects over-capacity connections, releases permits on handler exit, and rejects zero as invalid; focused regression coverage passes.
 - [x] Reproduce, repair, and regression-test every confirmed deep-audit defect found in this campaign; complete native, WASM, browser, frontend, and live WebSocket suites pass, and the result is pushed.
+- [x] Third verification campaign: inventory every implemented NEXUS feature and its existing automated or reproducible coverage before further changes.
+- [x] Third verification campaign: run the core CLI, indexing, retrieval, ranking, query, persistence, encrypted-index, SQLite, and neural-embedding paths. Isolated CLI and feature suites pass; no new core defect was reproduced.
+- [x] Third verification campaign: run crawler, API, WebSocket, WASM, browser, frontend, search-mode, and Tor CLI error paths. Controlled/public-crawl and desktop/mobile harnesses pass; no new defect was reproduced.
+- [ ] Third verification campaign: validate the optional `headless_render` crawler build on a machine with enough memory to compile `headless_chrome`; two constrained single-thread attempts here ended with compiler SIGTERM before Nexus code built.
+- [x] Third verification campaign: run final native regression and WASM release build, review the diff, and push the verified campaign record under `vincenzo-afk <itsmebk2007@gmail.com>`.
