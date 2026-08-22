@@ -10,7 +10,7 @@
 - [x] Make `nexus tor --check` return a nonzero error when the configured proxy is unreachable so scripts cannot treat a failed privacy check as success.
 - [x] Investigate the featureless wasm32 build failure: it omits the required `wasm` feature. The documented CI path (`cargo build --lib --release --target wasm32-unknown-unknown --features wasm`) passes and emits a 1,462,314-byte artifact, so no dependency change is needed.
 - [x] Test the generated 1,462,314-byte WASM artifact and browser bindings on desktop and mobile: local index/search, statistics, autocomplete, spelling, IndexedDB save/restore, endpoint validation, and fetch-backed web search passed. The real repository frontend also passed Web, Hybrid, Tor-warning, and Local-mode request/UI assertions at 1280×720 and 375×812 against a live same-origin API.
-- [x] Fix the two reproducible Tor CLI defects (persisted configuration and nonzero failed liveness checks) and rerun the final native, WASM, browser-binding, and desktop/mobile frontend regressions successfully. Commit, push, and final reporting remain next.
+- [x] Fix the two reproducible Tor CLI defects (persisted configuration and nonzero failed liveness checks) and rerun the final native, WASM, browser-binding, and desktop/mobile frontend regressions successfully; the verified audit commit is pushed to `origin/main`.
 - [ ] Audit configuration parsing, default-path behavior, atomic persistence, invalid command combinations, and interrupted-write resilience.
 - [x] Make resumable crawl-queue persistence crash-safe with collision-resistant temporary replacement and durable writes; round-trip and replacement-cleanup regressions pass.
 - [x] Make click-history persistence crash-safe with collision-resistant temporary replacement and durable writes; replacement and cleanup regressions pass.
@@ -38,4 +38,4 @@
 - [x] Exercise WebSocket capacity and message behavior plus frontend/WASM storage, request, malformed-input, cancellation, and mode-transition paths on desktop and mobile; focused and live harnesses pass.
 - [x] Key WebSocket message rate limits to the peer IP rather than a random session so reconnecting cannot reset the client bucket; focused reconnect-stability regression passes.
 - [x] Enforce `websocket.max_connections`: the listener now atomically rejects over-capacity connections, releases permits on handler exit, and rejects zero as invalid; focused regression coverage passes.
-- [ ] Reproduce, repair, and regression-test every confirmed deep-audit defect; run the complete affected suite and push the result.
+- [x] Reproduce, repair, and regression-test every confirmed deep-audit defect found in this campaign; complete native, WASM, browser, frontend, and live WebSocket suites pass, and the result is pushed.
