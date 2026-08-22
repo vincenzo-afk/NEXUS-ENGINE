@@ -6,7 +6,7 @@ pub mod snippet;
 
 #[allow(unused_imports)]
 pub use engine::{
-    apply_personal_boost, compute_result_features, search, search_query,
+    apply_personal_boost, compute_result_features, search, search_personalized, search_query,
     Personalization, SearchMode, SearchOutcome,
 };
 // Federation runs on the server only (real outbound HTTP to peers).

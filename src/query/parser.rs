@@ -19,6 +19,11 @@ use log::debug;
 /// Parses a raw query string into a [`QueryNode`] tree.
 pub fn parse(input: &str) -> Result<QueryNode> {
     debug!("parsing query: '{}'", input);
+    if input.chars().filter(|&character| character == '"').count() % 2 != 0 {
+        return Err(NexusError::QueryParse(
+            "unterminated quoted phrase".to_string(),
+        ));
+    }
     let tokens = lex(input);
     if tokens.is_empty() {
         return Err(NexusError::QueryParse("empty query".to_string()));
@@ -104,6 +109,9 @@ impl Parser {
                     .into_iter()
                     .map(|t| t.text)
                     .collect();
+                if terms.is_empty() {
+                    return Err(NexusError::QueryParse("empty phrase".to_string()));
+                }
                 Ok(QueryNode::Phrase(terms))
             }
             QueryToken::Filter { key, value } => build_filter(&key, &value),
@@ -217,6 +225,12 @@ fn parse_size(value: &str) -> Result<u64> {
     let number: f64 = num_part
         .parse()
         .map_err(|_| NexusError::QueryParse(format!("invalid size number: {}", num_part)))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(NexusError::QueryParse(format!(
+            "invalid size number: {}",
+            num_part
+        )));
+    }
 
     let multiplier: f64 = match unit_part.to_uppercase().as_str() {
         "" | "B" => 1.0,
@@ -231,7 +245,14 @@ fn parse_size(value: &str) -> Result<u64> {
         }
     };
 
-    Ok((number * multiplier) as u64)
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        return Err(NexusError::QueryParse(format!(
+            "size is out of range: {}",
+            value
+        )));
+    }
+    Ok(bytes as u64)
 }
 
 /// Parses a human duration string like `7d`, `24h`, `30m` into seconds.
@@ -244,6 +265,12 @@ fn parse_duration(value: &str) -> Result<i64> {
     let number: f64 = num_part
         .parse()
         .map_err(|_| NexusError::QueryParse(format!("invalid duration number: {}", num_part)))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(NexusError::QueryParse(format!(
+            "invalid duration number: {}",
+            num_part
+        )));
+    }
 
     let multiplier: f64 = match unit_part.to_lowercase().as_str() {
         "s" => 1.0,
@@ -259,7 +286,14 @@ fn parse_duration(value: &str) -> Result<i64> {
         }
     };
 
-    Ok((number * multiplier) as i64)
+    let seconds = number * multiplier;
+    if !seconds.is_finite() || seconds >= i64::MAX as f64 {
+        return Err(NexusError::QueryParse(format!(
+            "duration is out of range: {}",
+            value
+        )));
+    }
+    Ok(seconds as i64)
 }
 
 #[cfg(test)]
@@ -326,6 +360,20 @@ mod tests {
             node,
             QueryNode::Phrase(vec!["hello".into(), "world".into()])
         );
+    }
+
+    #[test]
+    fn rejects_blank_phrases_and_out_of_range_numeric_filters() {
+        assert!(parse("\"\"").is_err());
+        assert!(parse("\"   \"").is_err());
+        assert!(parse("size>999999999999999999999GB").is_err());
+        assert!(parse("modified<999999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn rejects_unterminated_quoted_phrase() {
+        let error = parse("rust \"ownership and borrowing").unwrap_err();
+        assert!(matches!(error, NexusError::QueryParse(message) if message == "unterminated quoted phrase"));
     }
 
     #[test]

@@ -33,6 +33,11 @@
 //! here instead of per-document).
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PERSONAL_MODEL_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A small, fixed, human-readable feature vector describing one
 /// candidate result at ranking time. Keeping this fixed-size and
@@ -190,7 +195,7 @@ impl PersonalRankingModel {
     /// module doc comment's whole point is that this model is small and
     /// auditable, and that should extend to being able to `cat` the
     /// file and read the learned weights directly.
-    pub fn load(path: &std::path::Path) -> crate::error::Result<PersonalRankingModel> {
+    pub fn load(path: &Path) -> crate::error::Result<PersonalRankingModel> {
         if !path.exists() {
             return Ok(PersonalRankingModel::default());
         }
@@ -201,13 +206,62 @@ impl PersonalRankingModel {
     }
 
     /// Saves the model to `path`, creating parent directories as needed.
-    pub fn save(&self, path: &std::path::Path) -> crate::error::Result<()> {
+    /// A synced temporary file in the destination directory is atomically
+    /// renamed into place so an interrupted update preserves the prior model.
+    pub fn save(&self, path: &Path) -> crate::error::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| crate::error::NexusError::io(parent, e))?;
         }
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| crate::error::NexusError::Other(format!("failed to serialize personal ranking model: {e}")))?;
-        std::fs::write(path, text).map_err(|e| crate::error::NexusError::io(path, e))
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().ok_or_else(|| {
+            crate::error::NexusError::Other(format!(
+                "personal ranking model path has no file name: {}",
+                path.display()
+            ))
+        })?;
+        let mut attempts = 0u8;
+        let (temp_path, mut temp_file) = loop {
+            let suffix = PERSONAL_MODEL_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 32 => {
+                    attempts += 1;
+                }
+                Err(error) => return Err(crate::error::NexusError::io(candidate, error)),
+            }
+        };
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if let Err(error) = temp_file.set_permissions(metadata.permissions()) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(crate::error::NexusError::io(&temp_path, error));
+            }
+        }
+        if let Err(error) = temp_file
+            .write_all(text.as_bytes())
+            .and_then(|_| temp_file.sync_all())
+        {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::error::NexusError::io(&temp_path, error));
+        }
+        drop(temp_file);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::error::NexusError::io(path, error));
+        }
+        Ok(())
     }
 }
 
@@ -349,5 +403,31 @@ mod tests {
         let restored: PersonalRankingModel = serde_json::from_str(&json).unwrap();
         assert_eq!(model.examples_seen(), restored.examples_seen());
         assert!((model.predict(&edu_features()) - restored.predict(&edu_features())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn save_replaces_model_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-personal-model-save-test-{}-{}",
+            std::process::id(),
+            PERSONAL_MODEL_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("personal-model.json");
+
+        let first = PersonalRankingModel::new();
+        first.save(&path).unwrap();
+
+        let mut replacement = PersonalRankingModel::new();
+        replacement.train_one(&edu_features(), 1.0);
+        replacement.save(&path).unwrap();
+
+        let loaded = PersonalRankingModel::load(&path).unwrap();
+        assert_eq!(loaded.examples_seen(), 1);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("personal-model.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

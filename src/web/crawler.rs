@@ -108,6 +108,8 @@ impl WebCrawler {
             max_retries: config.max_retries,
             retry_base_delay: Duration::from_millis(500),
             proxy_url,
+            allowed_redirect_domains: config.allowed_domains.clone(),
+            max_response_size_bytes: Some(config.max_page_size_bytes),
         })?;
         Ok(WebCrawler {
             http,

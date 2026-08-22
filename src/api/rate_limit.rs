@@ -200,30 +200,32 @@ impl RateLimiter {
     }
 
     pub fn extract_client_ip(&self, forwarded_for: Option<&str>, remote_addr: &str) -> String {
-        if let Some(header) = forwarded_for {
-            let proxies: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
-            if let Some(client_ip) = proxies.first() {
-                if !self
-                    .config
-                    .trusted_proxies
-                    .iter()
-                    .any(|p| client_ip.starts_with(p))
-                {
-                    return client_ip.to_string();
-                }
-                for ip in proxies.iter().rev() {
-                    if !self
-                        .config
-                        .trusted_proxies
-                        .iter()
-                        .any(|p| ip.starts_with(p))
-                    {
-                        return ip.to_string();
-                    }
-                }
-            }
+        let is_trusted = |address: &str| {
+            self.config
+                .trusted_proxies
+                .iter()
+                .any(|proxy| address == proxy || address.starts_with(proxy))
+        };
+
+        // Forwarding headers are attacker-controlled unless the TCP peer is
+        // explicitly configured as a trusted reverse proxy. Never allow a
+        // direct client to choose its own rate-limit bucket with X-Forwarded-For.
+        if !is_trusted(remote_addr) {
+            return remote_addr.to_string();
         }
-        remote_addr.to_string()
+
+        let Some(header) = forwarded_for else {
+            return remote_addr.to_string();
+        };
+        // Walk from the proxy nearest to this server towards the originating
+        // client. The first non-proxy hop is the address whose quota applies.
+        header
+            .split(',')
+            .map(str::trim)
+            .rev()
+            .find(|address| !address.is_empty() && !is_trusted(address))
+            .map(str::to_string)
+            .unwrap_or_else(|| remote_addr.to_string())
     }
 }
 
@@ -333,7 +335,7 @@ mod tests {
         let limiter = RateLimiter::new(test_config());
         assert_eq!(
             limiter.extract_client_ip(Some("203.0.113.5, 198.51.100.2"), "10.0.0.1"),
-            "203.0.113.5"
+            "10.0.0.1"
         );
     }
 
@@ -346,6 +348,28 @@ mod tests {
         assert_eq!(
             limiter.extract_client_ip(Some("203.0.113.5, 10.0.0.1"), "10.0.0.1"),
             "203.0.113.5"
+        );
+    }
+
+    #[test]
+    fn extract_client_ip_ignores_forwarded_values_from_untrusted_peers() {
+        let mut config = test_config();
+        config.trusted_proxies = vec!["10.0.0.".to_string()];
+        let limiter = RateLimiter::new(config);
+        assert_eq!(
+            limiter.extract_client_ip(Some("203.0.113.5"), "198.51.100.7"),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn extract_client_ip_returns_peer_when_trusted_proxy_only_reports_proxies() {
+        let mut config = test_config();
+        config.trusted_proxies = vec!["10.0.0.".to_string()];
+        let limiter = RateLimiter::new(config);
+        assert_eq!(
+            limiter.extract_client_ip(Some("10.0.0.2, 10.0.0.1"), "10.0.0.1"),
+            "10.0.0.1"
         );
     }
 }

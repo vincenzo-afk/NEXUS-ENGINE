@@ -8,7 +8,11 @@ use crate::error::{NexusError, Result};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CONFIG_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Ranking-related tunables, exposed so users can tweak relevance behavior
 /// without recompiling the engine.
@@ -570,15 +574,60 @@ impl Config {
     }
 
     /// Serializes and writes this configuration to `path`, creating parent
-    /// directories as needed.
+    /// directories as needed. The replacement is performed from a temporary
+    /// file in the destination directory, so an interrupted write leaves the
+    /// previously valid configuration in place instead of truncating it.
     pub fn save(&self, path: &Path) -> Result<()> {
         info!("saving config to {}", path.display());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
         let contents =
             toml::to_string_pretty(self).map_err(|e| NexusError::Config(e.to_string()))?;
-        std::fs::write(path, contents).map_err(|e| NexusError::io(path, e))?;
+
+        let file_name = path.file_name().ok_or_else(|| {
+            NexusError::Other(format!("configuration path has no file name: {}", path.display()))
+        })?;
+        let mut attempts = 0u8;
+        let (temp_path, mut temp_file) = loop {
+            let suffix = CONFIG_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 32 => {
+                    attempts += 1;
+                }
+                Err(error) => return Err(NexusError::io(candidate, error)),
+            }
+        };
+
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if let Err(error) = temp_file.set_permissions(metadata.permissions()) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(NexusError::io(&temp_path, error));
+            }
+        }
+        if let Err(error) = temp_file
+            .write_all(contents.as_bytes())
+            .and_then(|_| temp_file.sync_all())
+        {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(&temp_path, error));
+        }
+        drop(temp_file);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(path, error));
+        }
         info!("config saved to {}", path.display());
         Ok(())
     }
@@ -606,5 +655,53 @@ impl Config {
             debug!("folder not found: {}", folder.display());
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let suffix = CONFIG_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("nexus-config-{label}-{}-{suffix}", std::process::id()))
+    }
+
+    #[test]
+    fn save_replaces_existing_config_with_parseable_contents() {
+        let dir = unique_test_dir("atomic-save");
+        let path = dir.join("config.toml");
+        let first = Config::default();
+        first.save(&path).unwrap();
+
+        let mut replacement = Config::default();
+        replacement.cache_size = 17;
+        replacement.tor.proxy_port = 19050;
+        replacement.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.cache_size, 17);
+        assert_eq!(loaded.tor.proxy_port, 19050);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("config.toml")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_existing_config_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("permissions");
+        let path = dir.join("config.toml");
+        Config::default().save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Config::default().save(&path).unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

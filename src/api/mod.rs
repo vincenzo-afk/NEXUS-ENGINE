@@ -253,6 +253,77 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn header_value<'a>(request: &'a tiny_http::Request, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+fn allowed_cors_value<'a>(origin: Option<&'a str>, allowed_origins: &[String]) -> Option<&'a str> {
+    let origin = origin?;
+    if allowed_origins.iter().any(|allowed| allowed == "*") {
+        return Some("*");
+    }
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+        .then_some(origin)
+}
+
+fn api_key_from_headers<'a>(x_api_key: Option<&'a str>, authorization: Option<&'a str>) -> Option<&'a str> {
+    x_api_key.or_else(|| {
+        let (scheme, value) = authorization?.split_once(' ')?;
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then_some(value.trim())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn constant_time_key_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn request_is_authorized(request: &tiny_http::Request, config: &Config) -> bool {
+    if !config.security.api_require_auth {
+        return true;
+    }
+    let supplied = api_key_from_headers(
+        header_value(request, "X-API-Key"),
+        header_value(request, "Authorization"),
+    );
+    supplied.is_some_and(|key| {
+        config
+            .security
+            .api_keys
+            .iter()
+            .any(|configured| constant_time_key_eq(configured, key))
+    })
+}
+
+fn is_protected_api_path(path: &str) -> bool {
+    matches!(path, "/search" | "/suggest" | "/ask" | "/metrics" | "/open")
+        || path.starts_with("/view/")
+}
+
+/// Returns the unspoofable client identity used by the per-client rate
+/// limiter. A directly bound NEXUS server has no configured trusted proxy,
+/// so request-supplied forwarding headers must never influence this key.
+fn rate_limit_client_key(remote_addr: Option<&std::net::SocketAddr>) -> String {
+    remote_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Starts the search API server on `bind` (e.g. `"127.0.0.1:8080"`),
 /// serving from the index and configuration currently on disk. Blocks the
 /// current thread forever (or until the process is killed).
@@ -358,6 +429,18 @@ fn handle_request(
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
     debug!("request: {} {}", request.method(), url);
+    // Existing response branches attach CORS only when this vector is
+    // non-empty. Clone and clear it for an absent or disallowed Origin so
+    // those branches cannot emit an accidental wildcard response.
+    let mut request_config = config.clone();
+    let cors_value = allowed_cors_value(
+        header_value(&request, "Origin"),
+        &request_config.security.cors_allowed_origins,
+    );
+    if cors_value.is_none() {
+        request_config.security.cors_allowed_origins.clear();
+    }
+    let config = &request_config;
     let json_header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("static header is always valid");
     let xml_header = Header::from_bytes(
@@ -366,8 +449,35 @@ fn handle_request(
     )
     .expect("static header is always valid");
 
-    let cors_header = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..])
+    let cors_header = Header::from_bytes(
+        &b"Access-Control-Allow-Origin"[..],
+        cors_value.unwrap_or("null").as_bytes(),
+    )
         .expect("CORS header is always valid");
+
+    if request.method() == &Method::Options {
+        let mut response = Response::empty(204);
+        if !config.security.cors_allowed_origins.is_empty() {
+            response = response
+                .with_header(cors_header)
+                .with_header(
+                    Header::from_bytes(
+                        &b"Access-Control-Allow-Methods"[..],
+                        &b"GET, OPTIONS"[..],
+                    )
+                    .expect("static header is always valid"),
+                )
+                .with_header(
+                    Header::from_bytes(
+                        &b"Access-Control-Allow-Headers"[..],
+                        &b"Authorization, X-API-Key"[..],
+                    )
+                    .expect("static header is always valid"),
+                );
+        }
+        let _ = request.respond(response);
+        return;
+    }
 
     if request.method() != &Method::Get {
         let body = serde_json::to_string(&ApiError {
@@ -384,15 +494,22 @@ fn handle_request(
         return;
     }
 
-    let client_ip = request
-        .headers()
-        .iter()
-        .find(|h| {
-            let field_str = h.field.as_str().as_str();
-            field_str.eq_ignore_ascii_case("X-Forwarded-For")
+    if is_protected_api_path(path) && !request_is_authorized(&request, config) {
+        let body = serde_json::to_string(&ApiError {
+            error: "missing or invalid API key".to_string(),
         })
-        .and_then(|h| Some(h.value.as_str()))
-        .unwrap_or("unknown");
+        .unwrap_or_default();
+        let mut response = Response::from_string(body)
+            .with_status_code(401)
+            .with_header(json_header);
+        if !config.security.cors_allowed_origins.is_empty() {
+            response = response.with_header(cors_header);
+        }
+        let _ = request.respond(response);
+        return;
+    }
+
+    let client_ip = rate_limit_client_key(request.remote_addr());
 
     match path {
         "/metrics" => {
@@ -464,7 +581,7 @@ fn handle_request(
             let _ = request.respond(response);
         }
         "/search" => {
-            if !rate_limiter.consume(client_ip, 1) {
+            if !rate_limiter.consume(&client_ip, 1) {
                 let body = serde_json::to_string(&ApiError {
                     error: "rate limit exceeded, please slow down".to_string(),
                 })
@@ -649,7 +766,7 @@ fn handle_request(
             let _ = request.respond(http_response);
         }
         "/ask" => {
-            if !rate_limiter.consume(client_ip, 1) {
+            if !rate_limiter.consume(&client_ip, 1) {
                 let body = serde_json::to_string(&ApiError {
                     error: "rate limit exceeded, please slow down".to_string(),
                 })
@@ -871,9 +988,18 @@ fn run_search(
         .map(|s| search::SearchMode::from_query_param(s))
         .unwrap_or_default();
 
-    let outcome = search::search(index, &combined_ast, ranking, offset, limit, Some(&clicks), mode, Some(&crate::entity::SearchContext::current_os()));
+    let outcome = search::search_personalized(
+        index,
+        &combined_ast,
+        ranking,
+        offset,
+        limit,
+        Some(&clicks),
+        mode,
+        &personalization,
+        Some(&crate::entity::SearchContext::current_os()),
+    );
     let mut results = outcome.results;
-    crate::search::apply_personal_boost(&mut results, index, &personalization);
     let (total, local_count, web_count) = (outcome.total, outcome.local_count, outcome.web_count);
     let took_ms_pre_rerank = started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1215,6 +1341,46 @@ mod tests {
         (index, file_path)
     }
 
+    fn index_web_document(index: &mut Index, url: &str, title: &str, content: &str) -> crate::document::DocId {
+        let doc_id = index.index_document(Document {
+            metadata: DocumentMetadata {
+                path: PathBuf::from(url),
+                file_name: title.to_string(),
+                extension: "html".to_string(),
+                size_bytes: content.len() as u64,
+                modified_unix: 0,
+                token_count: 0,
+                acl: crate::entity::Acl::public(),
+            },
+            content: content.to_string(),
+        });
+        let domain = url::Url::parse(url).unwrap().host_str().unwrap().to_string();
+        index.web.insert(
+            doc_id,
+            crate::webdoc::WebPageMeta {
+                url: url.to_string(),
+                domain,
+                title: title.to_string(),
+                meta_description: String::new(),
+                lang: None,
+                author: None,
+                content_type: "html".to_string(),
+                fetched_unix: 0,
+                etag: None,
+                last_modified: None,
+                redirect_chain: Vec::new(),
+                simhash: 0,
+                depth: 0,
+                outgoing: Vec::new(),
+                incoming: Vec::new(),
+                pagerank: 0.0,
+                spam_score: 0.0,
+                policy_flag: None,
+            },
+        );
+        doc_id
+    }
+
     #[test]
     fn resolves_a_path_that_is_actually_indexed() {
         let (index, file_path) = index_with_local_file();
@@ -1292,5 +1458,108 @@ mod tests {
     fn empty_path_param_is_rejected() {
         let index = Index::new();
         assert!(resolve_indexed_path(&index, "").is_none());
+    }
+
+    #[test]
+    fn live_search_personalizes_before_the_requested_page_is_selected() {
+        let mut index = Index::new();
+        let ordinary_id = index_web_document(
+            &mut index,
+            "https://example.com/a",
+            "Ordinary Rust",
+            "rust ownership borrowing",
+        );
+        let preferred_id = index_web_document(
+            &mut index,
+            "https://example.edu/z",
+            "Academic Rust",
+            "rust ownership borrowing",
+        );
+        let work_dir = std::env::temp_dir().join(format!(
+            "nexus-api-personalization-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let model_path = work_dir.join("personal-ranking.json");
+        let mut model = crate::ranking::adaptive::PersonalRankingModel::new();
+        let ordinary_features = crate::ranking::adaptive::Features {
+            is_edu_or_gov_domain: false,
+            source_matches_frequently_clicked_kind: false,
+            recency_normalized: 0.0,
+            base_score_normalized: 0.5,
+        };
+        let preferred_features = crate::ranking::adaptive::Features {
+            is_edu_or_gov_domain: true,
+            ..ordinary_features
+        };
+        for _ in 0..100 {
+            model.train_one(&ordinary_features, 0.0);
+            model.train_one(&preferred_features, 1.0);
+        }
+        model.save(&model_path).unwrap();
+        let personalization = PersonalizationCache::new(
+            work_dir.join("clicks.nxc"),
+            model_path,
+        );
+        let response = run_search(
+            &index,
+            &ContentCache::new(work_dir.join("content-cache")),
+            &crate::config::RankingConfig::default(),
+            &crate::config::AiConfig::default(),
+            &personalization,
+            "rust",
+            0,
+            1,
+            &HashMap::from([("mode".to_string(), "web".to_string())]),
+        )
+        .unwrap();
+
+        assert_eq!(response.total, 2);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].title, "Academic Rust");
+        assert_ne!(ordinary_id, preferred_id);
+        std::fs::remove_dir_all(work_dir).ok();
+    }
+
+    #[test]
+    fn cors_allows_only_configured_origins_or_an_explicit_wildcard() {
+        let allowed = vec!["https://search.example".to_string()];
+        assert_eq!(
+            allowed_cors_value(Some("https://search.example"), &allowed),
+            Some("https://search.example")
+        );
+        assert_eq!(allowed_cors_value(Some("https://other.example"), &allowed), None);
+        assert_eq!(allowed_cors_value(None, &allowed), None);
+        assert_eq!(
+            allowed_cors_value(Some("https://other.example"), &["*".to_string()]),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn api_key_parsing_accepts_only_supported_header_forms() {
+        assert_eq!(api_key_from_headers(Some("key"), Some("Bearer ignored")), Some("key"));
+        assert_eq!(api_key_from_headers(None, Some("Bearer key")), Some("key"));
+        assert_eq!(api_key_from_headers(None, Some("Basic key")), None);
+        assert_eq!(api_key_from_headers(None, Some("Bearer   ")), None);
+        assert!(constant_time_key_eq("expected", "expected"));
+        assert!(!constant_time_key_eq("expected", "different"));
+        assert!(!constant_time_key_eq("short", "longer"));
+    }
+
+    #[test]
+    fn protected_paths_exclude_health_and_frontend_assets() {
+        assert!(is_protected_api_path("/search"));
+        assert!(is_protected_api_path("/view/tmp-file"));
+        assert!(!is_protected_api_path("/health"));
+        assert!(!is_protected_api_path("/app.js"));
+    }
+
+    #[test]
+    fn rate_limit_identity_uses_peer_address_not_forwarding_headers() {
+        let peer: std::net::SocketAddr = "192.0.2.9:44321".parse().unwrap();
+        assert_eq!(rate_limit_client_key(Some(&peer)), "192.0.2.9");
+        assert_eq!(rate_limit_client_key(None), "unknown");
     }
 }

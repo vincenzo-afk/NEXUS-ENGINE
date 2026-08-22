@@ -25,7 +25,9 @@ use crate::document::DocId;
 use crate::error::{NexusError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Exactly what was shown for one `nexus search` invocation: which
 /// document appeared at each absolute (`offset`-aware) 1-based rank.
@@ -47,6 +49,7 @@ pub struct LastShownResults {
 /// been rebuilt since, in which case the recorded doc IDs could now
 /// refer to entirely different documents.
 const MAX_AGE_SECS: i64 = 6 * 60 * 60; // 6 hours
+static LAST_SHOWN_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl LastShownResults {
     /// Builds the record `nexus search` should persist right after
@@ -89,11 +92,41 @@ impl LastShownResults {
     /// `nexus search` should log and move on if this fails, never fail
     /// the search itself over it.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
         let bytes = serde_json::to_vec(self).map_err(|e| NexusError::Other(e.to_string()))?;
-        std::fs::write(path, bytes).map_err(|e| NexusError::io(path, e))
+        let file_name = path.file_name().ok_or_else(|| {
+            NexusError::Other(format!("last-shown path has no file name: {}", path.display()))
+        })?;
+        let (temp_path, mut file) = loop {
+            let suffix = LAST_SHOWN_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(NexusError::io(candidate, error)),
+            }
+        };
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(&temp_path, error));
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(path, error));
+        }
+        Ok(())
     }
 
     /// Resolves `rank` to the exact document shown there, but only if
@@ -172,5 +205,31 @@ mod tests {
     fn load_of_a_missing_file_is_none_not_an_error() {
         let path = std::env::temp_dir().join("nexus-last-shown-definitely-does-not-exist.json");
         assert!(LastShownResults::load(&path).is_none());
+    }
+
+    #[test]
+    fn save_replaces_existing_record_without_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-last-shown-atomic-test-{}-{}",
+            std::process::id(),
+            LAST_SHOWN_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("last_search.json");
+        LastShownResults::from_shown_page("old", "local", 0, vec![1])
+            .save(&path)
+            .unwrap();
+        LastShownResults::from_shown_page("new", "web", 0, vec![7, 8])
+            .save(&path)
+            .unwrap();
+
+        let loaded = LastShownResults::load(&path).unwrap();
+        assert_eq!(loaded.resolve("old", "local", 1), None);
+        assert_eq!(loaded.resolve("new", "web", 2), Some(8));
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("last_search.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

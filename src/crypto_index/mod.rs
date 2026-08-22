@@ -45,8 +45,13 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type HmacSha256 = Hmac<Sha256>;
+
+static ENCRYPTED_INDEX_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A term's blinded identifier — an HMAC-SHA256 of the normalized term
 /// under the index's trapdoor key, hex-encoded. This is what's actually
@@ -178,13 +183,62 @@ impl EncryptedIndex {
     /// Saves the encrypted index to `path` as JSON — safe to write to
     /// any storage, trusted or not (that's the entire point: no term
     /// text or readable posting list is ever in this serialized form).
-    pub fn save(&self, path: &std::path::Path) -> crate::error::Result<()> {
+    /// The replacement is atomic within the destination directory, so an
+    /// interrupted export cannot truncate an already-valid index file.
+    pub fn save(&self, path: &Path) -> crate::error::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| crate::error::NexusError::io(parent, e))?;
         }
         let text = serde_json::to_string(self)
             .map_err(|e| crate::error::NexusError::Other(format!("failed to serialize encrypted index: {e}")))?;
-        std::fs::write(path, text).map_err(|e| crate::error::NexusError::io(path, e))
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().ok_or_else(|| {
+            crate::error::NexusError::Other(format!(
+                "encrypted-index path has no file name: {}",
+                path.display()
+            ))
+        })?;
+        let mut attempts = 0u8;
+        let (temp_path, mut temp_file) = loop {
+            let suffix = ENCRYPTED_INDEX_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 32 => {
+                    attempts += 1;
+                }
+                Err(error) => return Err(crate::error::NexusError::io(candidate, error)),
+            }
+        };
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if let Err(error) = temp_file.set_permissions(metadata.permissions()) {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(crate::error::NexusError::io(&temp_path, error));
+            }
+        }
+        if let Err(error) = temp_file
+            .write_all(text.as_bytes())
+            .and_then(|_| temp_file.sync_all())
+        {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::error::NexusError::io(&temp_path, error));
+        }
+        drop(temp_file);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::error::NexusError::io(path, error));
+        }
+        Ok(())
     }
 
     /// Loads a previously saved encrypted index from `path`.
@@ -286,6 +340,34 @@ mod tests {
         index.set_postings(&key, "confidential-project-codename", &[42]).unwrap();
         let serialized = serde_json::to_string(&index).unwrap();
         assert!(!serialized.contains("confidential-project-codename"));
+    }
+
+    #[test]
+    fn save_replaces_index_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-encrypted-index-save-test-{}-{}",
+            std::process::id(),
+            ENCRYPTED_INDEX_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("index.json");
+        let key = IndexKey::derive(b"a real passphrase, 16+ bytes long");
+
+        let mut first = EncryptedIndex::new();
+        first.set_postings(&key, "rust", &[1]).unwrap();
+        first.save(&path).unwrap();
+
+        let mut replacement = EncryptedIndex::new();
+        replacement.set_postings(&key, "rust", &[2, 3]).unwrap();
+        replacement.save(&path).unwrap();
+
+        let loaded = EncryptedIndex::load(&path).unwrap();
+        assert_eq!(loaded.query(&key, "rust").unwrap(), vec![2, 3]);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("index.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

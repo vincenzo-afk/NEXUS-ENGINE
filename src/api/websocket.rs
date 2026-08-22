@@ -5,9 +5,38 @@ use crate::storage::content_cache::ContentCache;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Instant;
 use tungstenite::{accept, Message};
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn try_acquire_connection(active: &Arc<AtomicUsize>, max_connections: usize) -> bool {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < max_connections).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn websocket_rate_key(peer_addr: &str) -> String {
+    match peer_addr.parse::<std::net::SocketAddr>() {
+        Ok(address) => format!("ws:{}", address.ip()),
+        // `start_ws_server` passes a real socket address, but keep a stable
+        // fallback for direct embedders rather than returning to random,
+        // per-session buckets if they provide another peer identifier.
+        Err(_) => format!("ws:{peer_addr}"),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -67,7 +96,7 @@ pub fn handle_websocket(
         session_id, peer_addr
     );
 
-    let rate_key = format!("ws:{}", session_id);
+    let rate_key = websocket_rate_key(&peer_addr);
 
     loop {
         let msg = match ws.read() {
@@ -252,15 +281,27 @@ pub fn start_ws_server(
     content_cache: Arc<ContentCache>,
     ranking: Arc<RankingConfig>,
     rate_limiter: Arc<RateLimiter>,
+    max_connections: usize,
 ) -> Result<(), crate::error::NexusError> {
+    if max_connections == 0 {
+        return Err(crate::error::NexusError::Other(
+            "WebSocket max_connections must be greater than zero".to_string(),
+        ));
+    }
     let listener = std::net::TcpListener::bind(bind).map_err(|e| {
         crate::error::NexusError::Other(format!("failed to bind WebSocket server on {bind}: {e}"))
     })?;
-    info!("WebSocket server listening on ws://{}", bind);
+    info!("WebSocket server listening on ws://{} (max connections: {})", bind, max_connections);
+    let active_connections = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if !try_acquire_connection(&active_connections, max_connections) {
+                    warn!("rejecting WebSocket connection: max_connections ({}) reached", max_connections);
+                    drop(stream);
+                    continue;
+                }
                 let peer = stream
                     .peer_addr()
                     .map(|a| a.to_string())
@@ -269,7 +310,9 @@ pub fn start_ws_server(
                 let content_cache = Arc::clone(&content_cache);
                 let ranking = Arc::clone(&ranking);
                 let rate_limiter = Arc::clone(&rate_limiter);
+                let permit = ConnectionPermit(Arc::clone(&active_connections));
                 std::thread::spawn(move || {
+                    let _permit = permit;
                     handle_websocket(stream, index, content_cache, ranking, rate_limiter, peer);
                 });
             }
@@ -336,5 +379,31 @@ mod tests {
         };
         let json = serde_json::to_string(&err).unwrap();
         assert_eq!(json, r#"{"error":"something went wrong"}"#);
+    }
+
+    #[test]
+    fn connection_cap_is_enforced_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        assert!(try_acquire_connection(&active, 1));
+        assert!(!try_acquire_connection(&active, 1));
+        {
+            let _permit = ConnectionPermit(Arc::clone(&active));
+            assert_eq!(active.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(try_acquire_connection(&active, 1));
+    }
+
+    #[test]
+    fn websocket_rate_key_is_stable_across_reconnect_ports() {
+        assert_eq!(
+            websocket_rate_key("203.0.113.7:41000"),
+            websocket_rate_key("203.0.113.7:41001")
+        );
+        assert_ne!(
+            websocket_rate_key("203.0.113.7:41000"),
+            websocket_rate_key("203.0.113.8:41000")
+        );
+        assert_eq!(websocket_rate_key("custom-peer"), "ws:custom-peer");
     }
 }

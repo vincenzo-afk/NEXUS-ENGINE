@@ -11,3 +11,31 @@
 - [x] Investigate the featureless wasm32 build failure: it omits the required `wasm` feature. The documented CI path (`cargo build --lib --release --target wasm32-unknown-unknown --features wasm`) passes and emits a 1,462,314-byte artifact, so no dependency change is needed.
 - [x] Test the generated 1,462,314-byte WASM artifact and browser bindings on desktop and mobile: local index/search, statistics, autocomplete, spelling, IndexedDB save/restore, endpoint validation, and fetch-backed web search passed. The real repository frontend also passed Web, Hybrid, Tor-warning, and Local-mode request/UI assertions at 1280×720 and 375×812 against a live same-origin API.
 - [x] Fix the two reproducible Tor CLI defects (persisted configuration and nonzero failed liveness checks) and rerun the final native, WASM, browser-binding, and desktop/mobile frontend regressions successfully. Commit, push, and final reporting remain next.
+- [ ] Audit configuration parsing, default-path behavior, atomic persistence, invalid command combinations, and interrupted-write resilience.
+- [x] Make resumable crawl-queue persistence crash-safe with collision-resistant temporary replacement and durable writes; round-trip and replacement-cleanup regressions pass.
+- [x] Make click-history persistence crash-safe with collision-resistant temporary replacement and durable writes; replacement and cleanup regressions pass.
+- [x] Make persisted autocomplete history crash-safe with collision-resistant temporary replacement and durable writes; replacement and cleanup regression passes.
+- [x] Make last-shown result persistence crash-safe with collision-resistant temporary replacement and durable writes; replacement and cleanup regression passes.
+- [x] Make crawler content-cache persistence crash-safe with collision-resistant temporary replacement and durable writes; replacement and cleanup regression passes.
+- [x] Make encrypted-index export persistence crash-safe with collision-resistant temporary replacement, durable writes, existing-permission preservation, and a replacement-cleanup regression.
+- [x] Make adaptive-ranking model persistence crash-safe with collision-resistant temporary replacement, durable writes, existing-permission preservation, and a replacement-cleanup regression.
+- [x] Make core index persistence use collision-resistant temporary files, durable writes, existing-permission preservation, and a concurrent-save regression that leaves one complete file with no temporary remnants.
+- [x] Reject impossible declared core-index payload lengths before allocating so corrupt files cannot trigger excessive memory allocation; focused malformed-length regression passes.
+- [x] Replace direct configuration-file overwrite with same-directory temporary-file replacement so an interrupted save cannot leave a truncated TOML configuration; regression tests verify parseable replacement, cleanup, and existing Unix permission preservation.
+- [x] Stress index mutation and retrieval with empty, Unicode, very long, duplicate, deleted, corrupt, and concurrent-access cases; focused retrieval and storage regressions pass.
+- [x] Audit ranking and query parsing edge cases, including operators, quotes, negation, malformed syntax, pagination boundaries, and deterministic ordering; existing and added focused regressions pass.
+- [x] Reject unterminated quoted phrases instead of silently treating malformed syntax as an exact phrase; focused parser regression passes.
+- [x] Apply personalization before pagination so an improved result outside the unpersonalized first page can be promoted into it; focused regression passes.
+- [x] Give equal-score search results deterministic path and document-ID tie-breakers so pagination does not depend on hash-map iteration; focused regression passes.
+- [x] Reject blank quoted phrases and numeric size or duration filters that overflow or become non-finite instead of silently turning them into broad or saturated queries; focused parser regressions pass.
+- [x] Exercise crawler and API boundary conditions: redirects, oversized responses, malformed payloads, 5xx retry limits, origin restrictions, and rate-limit recovery; focused loopback and isolated-server regressions pass.
+- [x] Apply personalization before pagination in the live HTTP search route so API users receive promoted results on the correct page; handler-level and core-search regressions pass.
+- [x] Prevent API rate-limit bypass through user-supplied `X-Forwarded-For`; rate limiting now derives the key from the TCP peer address unless a trusted-proxy policy is introduced, and a focused regression passes.
+- [x] Repair `RateLimiter::extract_client_ip`: it now honors forwarding headers only when the TCP peer is configured as trusted and selects the nearest non-proxy hop; all five helper regressions pass.
+- [x] Enforce `web_crawl.max_page_size_bytes` before a crawler response is fully buffered: declared oversized bodies are rejected before a read, and undeclared bodies stop after a bounded streaming read. Both loopback regressions pass.
+- [x] Enforce persisted API authentication and CORS settings: protected routes reject absent/invalid keys, accept `X-API-Key` or Bearer credentials, reflect only configured origins, and serve matching preflight headers. Unit and isolated live-server regressions pass.
+- [x] Prevent a seed URL that is allowlisted from following a redirect destination outside the configured domain allowlist. The HTTP client now blocks the redirect before an off-domain request, with regression coverage for exact, subdomain, IP, and suffix-lookalike hosts.
+- [x] Exercise WebSocket capacity and message behavior plus frontend/WASM storage, request, malformed-input, cancellation, and mode-transition paths on desktop and mobile; focused and live harnesses pass.
+- [x] Key WebSocket message rate limits to the peer IP rather than a random session so reconnecting cannot reset the client bucket; focused reconnect-stability regression passes.
+- [x] Enforce `websocket.max_connections`: the listener now atomically rejects over-capacity connections, releases permits on handler exit, and rejects zero as invalid; focused regression coverage passes.
+- [ ] Reproduce, repair, and regression-test every confirmed deep-audit defect; run the complete affected suite and push the result.

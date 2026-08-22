@@ -8,7 +8,11 @@
 use crate::document::DocId;
 use crate::error::{NexusError, Result};
 use log::debug;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CONTENT_CACHE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A directory of `{doc_id}.txt` files holding cached page text.
 #[derive(Debug, Clone)]
@@ -31,7 +35,34 @@ impl ContentCache {
         debug!("storing doc_id={} ({} bytes)", doc_id, text.len());
         std::fs::create_dir_all(&self.dir).map_err(|e| NexusError::io(&self.dir, e))?;
         let path = self.path_for(doc_id);
-        std::fs::write(&path, text).map_err(|e| NexusError::io(&path, e))
+        let (temp_path, mut file) = loop {
+            let suffix = CONTENT_CACHE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = self.dir.join(format!(
+                ".{doc_id}.{}.{}.tmp",
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(NexusError::io(candidate, error)),
+            }
+        };
+        if let Err(error) = file.write_all(text.as_bytes()).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(&temp_path, error));
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temp_path, &path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(NexusError::io(&path, error));
+        }
+        Ok(())
     }
 
     /// Loads cached text for `doc_id`, if present.
@@ -69,5 +100,24 @@ mod tests {
         cache.remove(42);
         assert!(cache.load(42).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn store_replaces_existing_content_without_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-content-cache-atomic-test-{}-{}",
+            std::process::id(),
+            CONTENT_CACHE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cache = ContentCache::new(dir.clone());
+        cache.store(42, "old content").unwrap();
+        cache.store(42, "new content").unwrap();
+        assert_eq!(cache.load(42).unwrap(), "new content");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("42.txt")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -9,8 +9,12 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static QUEUE_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One URL waiting to be crawled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,14 +181,42 @@ impl CrawlQueue {
 
     /// Persists the queue to `path` so a large crawl can be resumed later.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
-        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| NexusError::io(parent, e))?;
         let bytes = bincode::serialize(self).map_err(NexusError::Serialize)?;
-        std::fs::write(path, bytes).map_err(|e| {
-            warn!("failed to save queue to {}: {}", path.display(), e);
-            NexusError::io(path, e)
+        let file_name = path.file_name().ok_or_else(|| {
+            NexusError::Other(format!("crawl queue path has no file name: {}", path.display()))
         })?;
+        let (temp_path, mut file) = loop {
+            let suffix = QUEUE_SAVE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                suffix
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(NexusError::io(candidate, error)),
+            }
+        };
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            warn!("failed to save queue to {}: {}", path.display(), error);
+            return Err(NexusError::io(&temp_path, error));
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            warn!("failed to replace queue at {}: {}", path.display(), error);
+            return Err(NexusError::io(path, error));
+        }
         info!(
             "saved queue with {} entries to {}",
             self.len(),
@@ -281,5 +313,32 @@ mod tests {
         assert_eq!(loaded.total_seen(), 1);
         assert_eq!(loaded.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_replaces_existing_queue_without_leaving_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-queue-atomic-test-{}-{}",
+            std::process::id(),
+            QUEUE_SAVE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let path = dir.join("queue.nxq");
+        let mut first = CrawlQueue::new(0);
+        first.push("https://a.com/1".into(), "a.com".into(), 0, priority::SEED);
+        first.save(&path).unwrap();
+
+        let mut replacement = CrawlQueue::new(0);
+        replacement.push("https://b.com/1".into(), "b.com".into(), 0, priority::SEED);
+        replacement.push("https://b.com/2".into(), "b.com".into(), 0, priority::SEED);
+        replacement.save(&path).unwrap();
+
+        let loaded = CrawlQueue::load(&path).unwrap();
+        assert_eq!(loaded.total_seen(), 2);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("queue.nxq")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

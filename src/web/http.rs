@@ -15,6 +15,7 @@
 
 use crate::error::{NexusError, Result};
 use log::{debug, warn};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
@@ -35,6 +36,14 @@ pub struct HttpConfig {
     pub retry_base_delay: Duration,
     /// Optional SOCKS5 proxy URL (e.g. "socks5://127.0.0.1:9050").
     pub proxy_url: Option<String>,
+    /// If non-empty, redirects are followed only when their target host is
+    /// this domain or one of its subdomains. This lets the crawler enforce
+    /// its allowlist before an off-domain redirect is requested.
+    pub allowed_redirect_domains: Vec<String>,
+    /// Optional maximum response body size. When set, the client rejects an
+    /// oversized declared `Content-Length` before reading and stops a
+    /// chunked/undeclared body after the same bounded streaming budget.
+    pub max_response_size_bytes: Option<u64>,
 }
 
 impl Default for HttpConfig {
@@ -47,6 +56,8 @@ impl Default for HttpConfig {
             max_retries: 3,
             retry_base_delay: Duration::from_millis(500),
             proxy_url: None,
+            allowed_redirect_domains: Vec::new(),
+            max_response_size_bytes: None,
         }
     }
 }
@@ -109,10 +120,19 @@ impl HttpClient {
         let redirect_chain: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let chain_for_policy = Arc::clone(&redirect_chain);
         let max_redirects = config.max_redirects;
+        let allowed_redirect_domains = config.allowed_redirect_domains.clone();
 
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= max_redirects {
                 return attempt.error("too many redirects");
+            }
+            if !allowed_redirect_domains.is_empty() {
+                let Some(host) = attempt.url().host_str() else {
+                    return attempt.error("redirect target has no host");
+                };
+                if !redirect_target_allowed(host, &allowed_redirect_domains) {
+                    return attempt.error("redirect target is outside the allowed crawl domains");
+                }
             }
             if let Ok(mut chain) = chain_for_policy.lock() {
                 chain.push(attempt.url().to_string());
@@ -246,7 +266,7 @@ impl HttpClient {
     /// Converts a raw `reqwest` response into a [`FetchResponse`],
     /// draining the redirect chain collected by the custom redirect
     /// policy during this request.
-    fn to_fetch_response(&self, url: &str, resp: reqwest::blocking::Response) -> Result<FetchResponse> {
+    fn to_fetch_response(&self, url: &str, mut resp: reqwest::blocking::Response) -> Result<FetchResponse> {
         let status = resp.status().as_u16();
         let final_url = resp.url().to_string();
         let http_version = format!("{:?}", resp.version());
@@ -258,10 +278,33 @@ impl HttpClient {
             .map(|s| s.to_lowercase());
         let etag = header_str(&resp, reqwest::header::ETAG);
         let last_modified = header_str(&resp, reqwest::header::LAST_MODIFIED);
-        let bytes = resp
-            .bytes()
-            .map_err(|e| NexusError::http(url, e.to_string()))?
-            .to_vec();
+        if let Some(max_bytes) = self.config.max_response_size_bytes {
+            if resp.content_length().is_some_and(|length| length > max_bytes) {
+                return Err(NexusError::http(
+                    url,
+                    format!("response body exceeds configured {max_bytes}-byte limit"),
+                ));
+            }
+        }
+
+        let mut bytes = Vec::new();
+        match self.config.max_response_size_bytes {
+            Some(max_bytes) => {
+                resp.take(max_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| NexusError::http(url, e.to_string()))?;
+                if (bytes.len() as u64) > max_bytes {
+                    return Err(NexusError::http(
+                        url,
+                        format!("response body exceeds configured {max_bytes}-byte limit"),
+                    ));
+                }
+            }
+            None => {
+                resp.read_to_end(&mut bytes)
+                    .map_err(|e| NexusError::http(url, e.to_string()))?;
+            }
+        }
         let body = String::from_utf8_lossy(&bytes).into_owned();
 
         Ok(FetchResponse {
@@ -327,9 +370,22 @@ fn header_str(
         .map(|s| s.to_string())
 }
 
+/// Returns whether a redirect target remains inside one of the configured
+/// crawl domains. Exact hosts and subdomains are allowed; suffix lookalikes
+/// such as `not-example.com` are rejected.
+fn redirect_target_allowed(host: &str, allowed_domains: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed_domains.iter().any(|allowed| {
+        let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
+        !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{allowed}")))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn default_config_has_sane_bounds() {
@@ -343,5 +399,145 @@ mod tests {
     fn redirect_chain_starts_empty() {
         let client = HttpClient::new(HttpConfig::default()).unwrap();
         assert!(client.redirect_chain.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redirect_allowlist_allows_exact_hosts_and_subdomains_only() {
+        let allowed = vec!["example.com".to_string(), "127.0.0.1".to_string()];
+        assert!(redirect_target_allowed("example.com", &allowed));
+        assert!(redirect_target_allowed("docs.example.com", &allowed));
+        assert!(redirect_target_allowed("127.0.0.1", &allowed));
+        assert!(!redirect_target_allowed("not-example.com", &allowed));
+        assert!(!redirect_target_allowed("example.com.attacker.test", &allowed));
+    }
+
+    #[test]
+    fn blocks_off_allowlist_redirect_before_requesting_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/escaped\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let client = HttpClient::new(HttpConfig {
+            max_retries: 0,
+            allowed_redirect_domains: vec!["127.0.0.1".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let result = client.get(&format!("http://127.0.0.1:{port}/start"));
+        server.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside the allowed crawl domains"));
+    }
+
+    fn one_response_server(headers: &str, body: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let headers = headers.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\n{headers}\r\n").unwrap();
+            stream.write_all(body).unwrap();
+        });
+        (port, server)
+    }
+
+    fn status_sequence_server(statuses: Vec<u16>) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut served = 0;
+            for status in statuses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).unwrap();
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    502 => "Bad Gateway",
+                    503 => "Service Unavailable",
+                    _ => "Test Status",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+                served += 1;
+            }
+            served
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn retries_each_transient_5xx_up_to_the_configured_limit() {
+        let (port, server) = status_sequence_server(vec![503, 502, 200]);
+        let client = HttpClient::new(HttpConfig {
+            max_retries: 2,
+            retry_base_delay: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = client.get(&format!("http://127.0.0.1:{port}/retry")).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn does_not_retry_permanent_4xx_responses() {
+        let (port, server) = status_sequence_server(vec![404]);
+        let client = HttpClient::new(HttpConfig {
+            max_retries: 3,
+            retry_base_delay: Duration::ZERO,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = client.get(&format!("http://127.0.0.1:{port}/missing")).unwrap();
+
+        assert_eq!(response.status, 404);
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejects_oversized_declared_content_before_reading_body() {
+        let (port, server) = one_response_server("Content-Length: 32\r\nConnection: close\r\n", b"01234567890123456789012345678901");
+        let client = HttpClient::new(HttpConfig {
+            max_retries: 0,
+            max_response_size_bytes: Some(16),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = client.get(&format!("http://127.0.0.1:{port}/large"));
+        server.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("16-byte limit"));
+    }
+
+    #[test]
+    fn rejects_oversized_undeclared_body_after_bounded_read() {
+        let (port, server) = one_response_server("Connection: close\r\n", b"01234567890123456789012345678901");
+        let client = HttpClient::new(HttpConfig {
+            max_retries: 0,
+            max_response_size_bytes: Some(16),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = client.get(&format!("http://127.0.0.1:{port}/chunked"));
+        server.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("16-byte limit"));
     }
 }

@@ -1279,7 +1279,14 @@ fn cmd_serve_ws(config: &Config, bind: &str) -> Result<()> {
     info!("WebSocket search server listening on ws://{}", bind);
     println!("WebSocket search server listening on ws://{}", bind);
 
-    crate::api::websocket::start_ws_server(bind, index, content_cache, ranking, rate_limiter)
+    crate::api::websocket::start_ws_server(
+        bind,
+        index,
+        content_cache,
+        ranking,
+        rate_limiter,
+        config.websocket.max_connections,
+    )
         .map_err(|e| NexusError::Other(format!("WebSocket server failed: {}", e)))
 }
 

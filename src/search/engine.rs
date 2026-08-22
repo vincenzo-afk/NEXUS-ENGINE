@@ -237,7 +237,14 @@ pub fn apply_personal_boost(results: &mut [SearchResult], index: &Index, p: &Per
     // Personalization can reorder results relative to the rest of the
     // pipeline's ranking, so re-sort after applying it — same reasoning
     // as the primary sort after `apply_hybrid_ranker` above.
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(compare_search_results);
+}
+
+fn compare_search_results(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.path.cmp(&b.path))
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
 pub(crate) fn source_kind_for(is_web: bool, extension: &str) -> crate::entity::SourceKind {
@@ -261,6 +268,46 @@ pub fn search(
     limit: usize,
     clicks: Option<&crate::clicks::ClickLog>,
     mode: SearchMode,
+    ctx: Option<&crate::entity::SearchContext>,
+) -> SearchOutcome {
+    search_with_personalization(index, query, config, offset, limit, clicks, mode, None, ctx)
+}
+
+/// Executes [`search`] while applying a caller-supplied personal ranking model
+/// to the complete eligible candidate set before pagination.
+pub fn search_personalized(
+    index: &Index,
+    query: &QueryNode,
+    config: &crate::config::RankingConfig,
+    offset: usize,
+    limit: usize,
+    clicks: Option<&crate::clicks::ClickLog>,
+    mode: SearchMode,
+    personalization: &Personalization,
+    ctx: Option<&crate::entity::SearchContext>,
+) -> SearchOutcome {
+    search_with_personalization(
+        index,
+        query,
+        config,
+        offset,
+        limit,
+        clicks,
+        mode,
+        Some(personalization),
+        ctx,
+    )
+}
+
+fn search_with_personalization(
+    index: &Index,
+    query: &QueryNode,
+    config: &crate::config::RankingConfig,
+    offset: usize,
+    limit: usize,
+    clicks: Option<&crate::clicks::ClickLog>,
+    mode: SearchMode,
+    personalization: Option<&Personalization>,
     ctx: Option<&crate::entity::SearchContext>,
 ) -> SearchOutcome {
     info!("search query: {:?} (mode={:?})", query, mode);
@@ -423,11 +470,14 @@ pub fn search(
         apply_hybrid_ranker(&mut results, config);
     }
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Personalization must run on every eligible candidate rather than the
+    // already-paginated first page. Otherwise it can never promote a better
+    // personalized result from a later page into the page the user sees.
+    if let Some(personalization) = personalization {
+        apply_personal_boost(&mut results, index, personalization);
+    }
+
+    results.sort_by(compare_search_results);
 
     let total = results.len();
     let local_count = results.iter().filter(|r| !r.is_web).count();
@@ -469,10 +519,18 @@ pub fn search_query(
     ctx: Option<&crate::entity::SearchContext>,
 ) -> crate::error::Result<SearchOutcome> {
     let ast = crate::query::parse(raw_query)?;
-    let mut outcome = search(index, &ast, config, offset, limit, clicks, mode, ctx);
-    if let Some(p) = personalization {
-        apply_personal_boost(&mut outcome.results, index, p);
-    }
+    #[allow(unused_mut)]
+    let mut outcome = search_with_personalization(
+        index,
+        &ast,
+        config,
+        offset,
+        limit,
+        clicks,
+        mode,
+        personalization,
+        ctx,
+    );
     #[cfg(not(target_family = "wasm"))]
     {
         outcome.instant_answer = crate::answers::try_answer(raw_query);
@@ -1472,6 +1530,138 @@ mod tests {
                 b.score
             );
         }
+    }
+
+    #[test]
+    fn equal_scores_use_path_order_before_pagination() {
+        let mut index = Index::new();
+        index_local(&mut index, "/zeta.txt", "rust ownership");
+        index_local(&mut index, "/alpha.txt", "rust ownership");
+        let ast = crate::query::parse("rust").unwrap();
+        let config = crate::config::RankingConfig::default();
+
+        let first_page = search(&index, &ast, &config, 0, 1, None, SearchMode::Local, None);
+        let second_page = search(&index, &ast, &config, 1, 1, None, SearchMode::Local, None);
+
+        assert_eq!(first_page.results[0].path, PathBuf::from("/alpha.txt"));
+        assert_eq!(second_page.results[0].path, PathBuf::from("/zeta.txt"));
+    }
+
+    #[test]
+    fn unicode_normalization_retrieves_compatibility_form_text() {
+        let mut index = Index::new();
+        let doc_id = index_local(
+            &mut index,
+            "/unicode.txt",
+            "ＡＮＥＷ full-width document about Ｒｕｓｔ ownership",
+        );
+
+        let outcome = parse_and_search(&index, "rust", SearchMode::Local);
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].doc_id, doc_id);
+    }
+
+    #[test]
+    fn reindexing_a_path_replaces_stale_terms_and_keeps_one_document() {
+        let mut index = Index::new();
+        let stale_id = index_local(&mut index, "/changing.txt", "obsoleteword legacy content");
+        let current_id = index_local(&mut index, "/changing.txt", "currentword fresh content");
+
+        assert_ne!(stale_id, current_id);
+        assert_eq!(index.document_count(), 1);
+        assert!(parse_and_search(&index, "obsoleteword", SearchMode::Local)
+            .results
+            .is_empty());
+        let current = parse_and_search(&index, "currentword", SearchMode::Local);
+        assert_eq!(current.results.len(), 1);
+        assert_eq!(current.results[0].doc_id, current_id);
+    }
+
+    #[test]
+    fn empty_and_removed_documents_do_not_leave_searchable_postings() {
+        let mut index = Index::new();
+        index_local(&mut index, "/empty.txt", "");
+        let removable_id = index_local(&mut index, "/remove.txt", "removableterm");
+
+        assert!(parse_and_search(&index, "removableterm", SearchMode::Local)
+            .results
+            .iter()
+            .any(|result| result.doc_id == removable_id));
+        assert!(index.remove_document(removable_id));
+        assert_eq!(index.document_count(), 1);
+        assert!(parse_and_search(&index, "removableterm", SearchMode::Local)
+            .results
+            .is_empty());
+        assert_eq!(index.inverted.document_count, 1);
+        assert_eq!(index.inverted.total_token_count, 0);
+    }
+
+    #[test]
+    fn personalization_can_promote_a_later_candidate_before_pagination() {
+        let mut index = Index::new();
+        let ordinary_id = index_web(
+            &mut index,
+            "https://example.com/a",
+            "Ordinary Rust",
+            "rust ownership borrowing",
+        );
+        let preferred_id = index_web(
+            &mut index,
+            "https://example.edu/z",
+            "Academic Rust",
+            "rust ownership borrowing",
+        );
+        index.web.get_mut(preferred_id).unwrap().domain = "example.edu".to_string();
+
+        let config = crate::config::RankingConfig::default();
+        let baseline = search_query(
+            &index,
+            "rust",
+            &config,
+            0,
+            1,
+            None,
+            SearchMode::Web,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(baseline.results[0].doc_id, ordinary_id);
+
+        let mut model = crate::ranking::adaptive::PersonalRankingModel::new();
+        let ordinary_features = crate::ranking::adaptive::Features {
+            is_edu_or_gov_domain: false,
+            source_matches_frequently_clicked_kind: false,
+            recency_normalized: 0.0,
+            base_score_normalized: 0.5,
+        };
+        let preferred_features = crate::ranking::adaptive::Features {
+            is_edu_or_gov_domain: true,
+            ..ordinary_features
+        };
+        for _ in 0..100 {
+            model.train_one(&ordinary_features, 0.0);
+            model.train_one(&preferred_features, 1.0);
+        }
+        let personalization = Personalization {
+            model: &model,
+            frequently_clicked_kind: None,
+        };
+        let personalized = search_query(
+            &index,
+            "rust",
+            &config,
+            0,
+            1,
+            None,
+            SearchMode::Web,
+            Some(&personalization),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(personalized.results[0].doc_id, preferred_id);
     }
 
     #[test]
