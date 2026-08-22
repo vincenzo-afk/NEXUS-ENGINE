@@ -24,6 +24,7 @@ use crate::web::{WebCrawlOptions, WebCrawler};
 use log::{debug, info, warn};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -122,7 +123,7 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
             disable,
             proxy,
             check,
-        } => cmd_tor(&config, enable, disable, proxy, check),
+        } => cmd_tor(&mut config, config_path, enable, disable, proxy, check),
         Commands::Benchmark {
             iterations,
             queries,
@@ -804,14 +805,7 @@ fn run_crawl_pass(
     let mut index = load_index(config)?;
     let content_cache = ContentCache::new(config.content_cache_dir.clone());
     let tor_config = if config.tor.enabled {
-        Some(network::tor::TorConfig {
-            enabled: true,
-            proxy_addr: format!("{}:{}", config.tor.proxy_host, config.tor.proxy_port)
-                .parse()
-                .unwrap_or_else(|_| "127.0.0.1:9050".parse().unwrap()),
-            identity_rotation_minutes: config.tor.identity_rotation_minutes,
-            ..Default::default()
-        })
+        Some(configured_tor_config(config)?)
     } else {
         None
     };
@@ -1289,40 +1283,110 @@ fn cmd_serve_ws(config: &Config, bind: &str) -> Result<()> {
         .map_err(|e| NexusError::Other(format!("WebSocket server failed: {}", e)))
 }
 
+fn tor_proxy_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn configured_tor_config(config: &Config) -> Result<network::tor::TorConfig> {
+    let proxy = tor_proxy_address(&config.tor.proxy_host, config.tor.proxy_port);
+    let proxy_addr: SocketAddr = proxy
+        .to_socket_addrs()
+        .map_err(|e| NexusError::Other(format!("invalid Tor proxy '{proxy}': {e}")))?
+        .next()
+        .ok_or_else(|| NexusError::Other(format!("invalid Tor proxy '{proxy}': no address resolved")))?;
+
+    Ok(network::tor::TorConfig {
+        enabled: config.tor.enabled,
+        proxy_addr,
+        identity_rotation_minutes: config.tor.identity_rotation_minutes,
+        ..Default::default()
+    })
+}
+
+fn parse_tor_proxy_setting(proxy: &str) -> Result<(String, u16)> {
+    let proxy = proxy.trim();
+    let (host, port_text) = if let Some(rest) = proxy.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:" )
+            .ok_or_else(|| NexusError::Other("Tor proxy must use host:port or [ipv6]:port".to_string()))?;
+        (host, port)
+    } else {
+        proxy
+            .rsplit_once(':')
+            .ok_or_else(|| NexusError::Other("Tor proxy must use host:port".to_string()))?
+    };
+    if host.trim().is_empty() {
+        return Err(NexusError::Other("Tor proxy host cannot be empty".to_string()));
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| NexusError::Other("Tor proxy port must be an integer between 1 and 65535".to_string()))?;
+    if port == 0 {
+        return Err(NexusError::Other("Tor proxy port must be between 1 and 65535".to_string()));
+    }
+    Ok((host.trim().to_string(), port))
+}
+
 fn cmd_tor(
-    config: &Config,
+    config: &mut Config,
+    config_path: &Path,
     enable: bool,
     disable: bool,
     proxy: Option<String>,
     check: bool,
 ) -> Result<()> {
+    if enable && disable {
+        return Err(NexusError::Other("use either --enable or --disable, not both".to_string()));
+    }
+
+    let mut changed = false;
+    if enable {
+        config.tor.enabled = true;
+        changed = true;
+        println!("Tor proxy enabled");
+        info!("Tor proxy enabled via CLI");
+    }
+    if disable {
+        config.tor.enabled = false;
+        changed = true;
+        println!("Tor proxy disabled");
+        info!("Tor proxy disabled via CLI");
+    }
+    if let Some(ref addr) = proxy {
+        let (host, port) = parse_tor_proxy_setting(addr)?;
+        config.tor.proxy_host = host;
+        config.tor.proxy_port = port;
+        changed = true;
+        println!("Tor proxy set to {}", tor_proxy_address(&config.tor.proxy_host, config.tor.proxy_port));
+        info!("Tor proxy address set via CLI");
+    }
+    if changed {
+        config.save(config_path)?;
+    }
+
     if check {
-        let tor_config = network::tor::TorConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        let mut tor_config = configured_tor_config(config)?;
+        // A liveness check is explicitly requested, so attempt it against
+        // the configured proxy even when normal Tor crawling is disabled.
+        tor_config.enabled = true;
         if network::tor::check_tor_reachable(&tor_config) {
             println!("Tor is reachable via {}", tor_config.proxy_addr);
             info!("Tor reachability check passed");
         } else {
             println!("Tor is NOT reachable");
             info!("Tor reachability check failed");
+            return Err(NexusError::Other(format!(
+                "Tor is not reachable via {}",
+                tor_config.proxy_addr
+            )));
         }
         return Ok(());
     }
 
-    if enable {
-        println!("Tor proxy enabled (configure in config.toml under [tor])");
-        info!("Tor proxy enabled via CLI");
-    }
-    if disable {
-        println!("Tor proxy disabled (configure in config.toml under [tor])");
-        info!("Tor proxy disabled via CLI");
-    }
-    if let Some(ref addr) = proxy {
-        println!("Tor proxy set to {}", addr);
-        info!("Tor proxy address set to {}", addr);
-    }
     if !enable && !disable && proxy.is_none() && !check {
         let status = if config.tor.enabled {
             "enabled"
@@ -1518,5 +1582,46 @@ mod tests {
     fn load_seed_file_missing_file_is_an_error() {
         let path = std::env::temp_dir().join("nexus-cli-test-definitely-missing-seeds.txt");
         assert!(load_seed_file(&path).is_err());
+    }
+
+    #[test]
+    fn parses_tor_proxy_settings_for_hosts_and_ipv6() {
+        assert_eq!(
+            parse_tor_proxy_setting("localhost:9150").unwrap(),
+            ("localhost".to_string(), 9150)
+        );
+        assert_eq!(
+            parse_tor_proxy_setting("[::1]:9050").unwrap(),
+            ("::1".to_string(), 9050)
+        );
+        assert!(parse_tor_proxy_setting("localhost").is_err());
+        assert!(parse_tor_proxy_setting("localhost:0").is_err());
+    }
+
+    #[test]
+    fn tor_cli_persists_enable_disable_and_proxy_settings() {
+        let dir = std::env::temp_dir().join(format!("nexus-tor-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.save(&path).unwrap();
+
+        cmd_tor(
+            &mut config,
+            &path,
+            true,
+            false,
+            Some("127.0.0.1:19150".to_string()),
+            false,
+        )
+        .unwrap();
+        let persisted = Config::load_or_create(&path).unwrap();
+        assert!(persisted.tor.enabled);
+        assert_eq!(persisted.tor.proxy_host, "127.0.0.1");
+        assert_eq!(persisted.tor.proxy_port, 19150);
+
+        cmd_tor(&mut config, &path, false, true, None, false).unwrap();
+        assert!(!Config::load_or_create(&path).unwrap().tor.enabled);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

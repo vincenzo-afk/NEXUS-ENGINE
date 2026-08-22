@@ -1,0 +1,13 @@
+# NEXUS-ENGINE Validation TODO
+
+- [x] Create an implementation-backed test matrix and isolated corpus covering CLI commands, local indexing, retrieval modes, crawler safety, HTTP endpoints, WebSocket behavior, WASM bindings, and the static frontend.
+- [x] Test local indexing and retrieval with a temporary corpus: indexing, stats, folder listing, exact and multi-term retrieval, extension filtering, pagination, snippets, suggestions, click history, and encrypted export/search all passed.
+- [x] Test crawling and web-search behavior against one bounded public HTTPS page: a robots-respecting, one-page, depth-zero crawl indexed `example.org`; Web mode returned the live page, Hybrid returned both sources, and Tor mode excluded non-onion content.
+- [x] Test HTTP health, hybrid search, suggestions, missing-query and pagination rejection, bangs, indexed-file viewing, unindexed-path protection, disabled-AI reporting, metrics, OpenSearch, GET-only enforcement, and rate limiting; all assertions passed.
+- [x] Test WebSocket local and hybrid search-as-you-type, malformed JSON, missing-query handling, and cancellation; all assertions passed.
+- [ ] Re-run real onion reachability from a network where Tor can complete bootstrap. A temporary local SOCKS listener was configured and an official Tor Project landing-page request was attempted, but sandbox relay TLS failures prevented a circuit from being established.
+- [x] Fix the confirmed Tor CLI defect: `--enable`, `--disable`, and `--proxy` now persist configuration, and `--check` uses the configured proxy address.
+- [x] Make `nexus tor --check` return a nonzero error when the configured proxy is unreachable so scripts cannot treat a failed privacy check as success.
+- [x] Investigate the featureless wasm32 build failure: it omits the required `wasm` feature. The documented CI path (`cargo build --lib --release --target wasm32-unknown-unknown --features wasm`) passes and emits a 1,462,314-byte artifact, so no dependency change is needed.
+- [x] Test the generated 1,462,314-byte WASM artifact and browser bindings on desktop and mobile: local index/search, statistics, autocomplete, spelling, IndexedDB save/restore, endpoint validation, and fetch-backed web search passed. The real repository frontend also passed Web, Hybrid, Tor-warning, and Local-mode request/UI assertions at 1280×720 and 375×812 against a live same-origin API.
+- [x] Fix the two reproducible Tor CLI defects (persisted configuration and nonzero failed liveness checks) and rerun the final native, WASM, browser-binding, and desktop/mobile frontend regressions successfully. Commit, push, and final reporting remain next.
