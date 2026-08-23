@@ -161,6 +161,11 @@ pub struct WebCrawlConfig {
     /// elevated priority, similar to sitemap discovery.
     #[serde(default = "default_true")]
     pub discover_feeds: bool,
+    /// Restrict this crawl to `.onion` hosts. This is set by the explicit
+    /// `nexus crawl --tor-only` command path after a live Tor circuit check;
+    /// it is not enabled for ordinary Web crawling.
+    #[serde(default)]
+    pub onion_only: bool,
 }
 
 fn default_max_pages_per_domain() -> usize {
@@ -187,6 +192,7 @@ impl Default for WebCrawlConfig {
             max_pages_per_domain: default_max_pages_per_domain(),
             discover_sitemaps: true,
             discover_feeds: true,
+            onion_only: false,
         }
     }
 }

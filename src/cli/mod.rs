@@ -131,6 +131,11 @@ pub enum Commands {
         /// Ignore robots.txt (not recommended; only for infrastructure you control).
         #[arg(long)]
         ignore_robots: bool,
+        /// Crawl only `.onion` seeds and discovered `.onion` links through a
+        /// configured, live Tor SOCKS circuit. This keeps onion crawling
+        /// explicit and bounded; it cannot be combined with `--ignore-robots`.
+        #[arg(long)]
+        tor_only: bool,
         /// Keep running, re-crawling the same seeds repeatedly on a fixed
         /// interval, instead of exiting after one pass. Intended to be
         /// run under a process supervisor (systemd, a container restart

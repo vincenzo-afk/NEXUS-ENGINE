@@ -93,6 +93,7 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
             allowed_domains,
             resume,
             ignore_robots,
+            tor_only,
             watch,
             interval,
         } => cmd_crawl(
@@ -104,6 +105,7 @@ pub fn run(command: Commands, config_path: &Path) -> Result<()> {
             allowed_domains,
             resume,
             ignore_robots,
+            tor_only,
             watch,
             interval,
         ),
@@ -674,6 +676,7 @@ fn cmd_crawl(
     allowed_domains: Vec<String>,
     resume: bool,
     ignore_robots: bool,
+    tor_only: bool,
     watch: bool,
     interval: u64,
 ) -> Result<()> {
@@ -694,8 +697,8 @@ fn cmd_crawl(
     urls.retain(|u| seen.insert(u.clone()));
 
     info!(
-        "crawl command: urls={:?}, max_pages={:?}, max_depth={:?}, resume={}, ignore_robots={}, watch={}, interval={}s",
-        urls, max_pages, max_depth, resume, ignore_robots, watch, interval
+        "crawl command: urls={:?}, max_pages={:?}, max_depth={:?}, resume={}, ignore_robots={}, tor_only={}, watch={}, interval={}s",
+        urls, max_pages, max_depth, resume, ignore_robots, tor_only, watch, interval
     );
 
     if urls.is_empty() && !resume {
@@ -704,6 +707,15 @@ fn cmd_crawl(
             "no seed URLs given; pass one or more URLs, or --resume to continue a saved crawl"
         );
         return Ok(());
+    }
+
+    if tor_only {
+        if ignore_robots {
+            return Err(NexusError::Other(
+                "--tor-only cannot be combined with --ignore-robots".to_string(),
+            ));
+        }
+        validate_tor_only_seeds(&urls)?;
     }
 
     if watch {
@@ -729,6 +741,7 @@ fn cmd_crawl(
                 max_depth,
                 allowed_domains.clone(),
                 ignore_robots,
+                tor_only,
             ) {
                 warn!("crawl pass failed: {}", e);
                 println!("crawl pass failed: {} (will retry next interval)", e);
@@ -737,7 +750,15 @@ fn cmd_crawl(
             std::thread::sleep(Duration::from_secs(interval));
         }
     } else {
-        run_crawl_pass(config, urls, max_pages, max_depth, allowed_domains, ignore_robots)
+        run_crawl_pass(
+            config,
+            urls,
+            max_pages,
+            max_depth,
+            allowed_domains,
+            ignore_robots,
+            tor_only,
+        )
     }
 }
 
@@ -775,6 +796,33 @@ fn load_seed_file(path: &std::path::Path) -> Result<Vec<String>> {
     Ok(urls)
 }
 
+/// Validates an explicit onion-only crawl request before any network request
+/// is made. General web crawls keep their existing seed behavior; this guard
+/// exists solely to prevent `--tor-only` from becoming a hidden clearnet
+/// proxy or unbounded mixed crawl.
+fn validate_tor_only_seeds(urls: &[String]) -> Result<()> {
+    if urls.is_empty() {
+        return Err(NexusError::Other(
+            "--tor-only requires at least one .onion seed URL".to_string(),
+        ));
+    }
+    for seed in urls {
+        let parsed = url::Url::parse(seed)
+            .map_err(|_| NexusError::Other(format!("invalid Tor seed URL: {seed}")))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed
+                .host_str()
+                .map(network::tor::is_onion_address)
+                .unwrap_or(false)
+        {
+            return Err(NexusError::Other(format!(
+                "--tor-only accepts only http(s) .onion seed URLs: {seed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn run_crawl_pass(
     config: &Config,
     urls: Vec<String>,
@@ -782,6 +830,7 @@ fn run_crawl_pass(
     max_depth: Option<u32>,
     allowed_domains: Vec<String>,
     ignore_robots: bool,
+    tor_only: bool,
 ) -> Result<()> {
     let mut web_config: WebCrawlConfig = config.web_crawl.clone();
     if let Some(n) = max_pages {
@@ -801,10 +850,17 @@ fn run_crawl_pass(
         warn!("robots.txt checks disabled for this crawl");
         println!("warning: robots.txt checks disabled for this crawl");
     }
+    if tor_only {
+        web_config.onion_only = true;
+    }
 
     let mut index = load_index(config)?;
     let content_cache = ContentCache::new(config.content_cache_dir.clone());
-    let tor_config = if config.tor.enabled {
+    let tor_config = if tor_only {
+        let tor_config = configured_tor_config(config)?;
+        network::tor::require_tor_reachable(&tor_config)?;
+        Some(tor_config)
+    } else if config.tor.enabled {
         Some(configured_tor_config(config)?)
     } else {
         None
@@ -1630,5 +1686,13 @@ mod tests {
         cmd_tor(&mut config, &path, false, true, None, false).unwrap();
         assert!(!Config::load_or_create(&path).unwrap().tor.enabled);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tor_only_seed_validation_accepts_onion_urls_and_rejects_other_inputs() {
+        assert!(validate_tor_only_seeds(&["http://example.onion/index".to_string()]).is_ok());
+        assert!(validate_tor_only_seeds(&["https://example.com".to_string()]).is_err());
+        assert!(validate_tor_only_seeds(&["ftp://example.onion/archive".to_string()]).is_err());
+        assert!(validate_tor_only_seeds(&[]).is_err());
     }
 }

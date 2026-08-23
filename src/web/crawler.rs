@@ -253,11 +253,10 @@ impl WebCrawler {
                 continue;
             }
 
-            let format = response
-                .content_type
-                .as_deref()
-                .map(DocumentFormat::from_content_type)
-                .unwrap_or(DocumentFormat::Html);
+            let format = DocumentFormat::from_http_response(
+                response.content_type.as_deref(),
+                &entry.url,
+            );
 
             // Populated by the classify pass in the `Html` arm below; other
             // formats have no HTML to run the heuristics on, so they stay
@@ -722,6 +721,9 @@ impl WebCrawler {
     }
 
     fn domain_allowed(&self, domain: &str) -> bool {
+        if self.config.onion_only && !crate::network::tor::is_onion_address(domain) {
+            return false;
+        }
         if self.config.allowed_domains.is_empty() {
             return true;
         }

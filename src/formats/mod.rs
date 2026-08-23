@@ -99,6 +99,34 @@ impl DocumentFormat {
         }
     }
 
+    /// Chooses an extractor from an explicit HTTP media type first, falling
+    /// back to the canonical URL extension only when the server omitted the
+    /// type or supplied a generic download type. This lets the crawler handle
+    /// public PDFs, Office files, archives, and images from servers that use
+    /// `application/octet-stream`, while avoiding a URL suffix overriding a
+    /// meaningful declared media type.
+    pub fn from_http_response(content_type: Option<&str>, url: &str) -> DocumentFormat {
+        let declared = content_type
+            .map(Self::from_content_type)
+            .unwrap_or(DocumentFormat::PlainText);
+        if declared != DocumentFormat::PlainText || !has_generic_or_missing_content_type(content_type)
+        {
+            return declared;
+        }
+
+        let path = url::Url::parse(url)
+            .map(|parsed| parsed.path().to_string())
+            .unwrap_or_else(|_| url.split(['?', '#']).next().unwrap_or(url).to_string());
+        let extension = std::path::Path::new(&path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase());
+        extension
+            .as_deref()
+            .map(Self::from_extension)
+            .unwrap_or(DocumentFormat::PlainText)
+    }
+
     /// Short label used for `WebPageMeta::content_type` and CLI display.
     pub fn label(&self) -> &'static str {
         match self {
@@ -117,6 +145,22 @@ impl DocumentFormat {
             DocumentFormat::SqliteDb => "sqlite",
             DocumentFormat::Image => "image",
         }
+    }
+}
+
+fn has_generic_or_missing_content_type(content_type: Option<&str>) -> bool {
+    match content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "application/octet-stream" | "binary/octet-stream" | "application/download"
+        | "application/force-download" => true,
+        _ => false,
     }
 }
 
@@ -255,6 +299,36 @@ mod tests {
         assert_eq!(
             DocumentFormat::from_content_type("text/html"),
             DocumentFormat::Html
+        );
+    }
+
+    #[test]
+    fn generic_download_content_type_uses_canonical_url_extension() {
+        assert_eq!(
+            DocumentFormat::from_http_response(
+                Some("application/octet-stream"),
+                "https://example.org/reports/annual.PDF?download=1",
+            ),
+            DocumentFormat::Pdf
+        );
+        assert_eq!(
+            DocumentFormat::from_http_response(None, "https://example.org/slides/deck.pptx"),
+            DocumentFormat::Pptx
+        );
+    }
+
+    #[test]
+    fn explicit_http_content_type_wins_over_url_extension() {
+        assert_eq!(
+            DocumentFormat::from_http_response(
+                Some("application/json"),
+                "https://example.org/download/report.pdf",
+            ),
+            DocumentFormat::Json
+        );
+        assert_eq!(
+            DocumentFormat::from_http_response(Some("text/plain"), "https://example.org/file.pdf"),
+            DocumentFormat::PlainText
         );
     }
 

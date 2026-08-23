@@ -96,6 +96,24 @@ pub fn check_tor_reachable(config: &TorConfig) -> bool {
     }
 }
 
+/// Refuse onion crawling unless a configured SOCKS proxy has completed a
+/// fresh liveness check. Building a proxy client alone is not sufficient: it
+/// only validates local settings and does not establish a Tor circuit.
+pub fn require_tor_reachable(config: &TorConfig) -> Result<()> {
+    if !config.enabled {
+        return Err(NexusError::Other(
+            "Tor-only crawling requires an enabled Tor SOCKS proxy".to_string(),
+        ));
+    }
+    if !check_tor_reachable(config) {
+        return Err(NexusError::Other(format!(
+            "Tor-only crawling requires a reachable Tor circuit via {}",
+            config.proxy_addr
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +175,15 @@ mod tests {
             ..TorConfig::default()
         };
         assert!(!check_tor_reachable(&config));
+    }
+
+    #[test]
+    fn onion_crawling_rejects_a_disabled_tor_proxy_without_network_access() {
+        let config = TorConfig {
+            enabled: false,
+            ..TorConfig::default()
+        };
+        assert!(require_tor_reachable(&config).is_err());
     }
 
     #[test]
