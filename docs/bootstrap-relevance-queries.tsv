@@ -1,0 +1,9 @@
+# query	expected domain or title term	intent
+rust book	doc.rust-lang.org	Rust learning material
+serde crate documentation	docs.rs	Rust crate reference
+http protocol	developer.mozilla.org	Web protocol documentation
+robots exclusion	rfc-editor.org	Crawler-policy specification
+search engine	wikipedia.org	Search-engine reference material
+linux kernel	kernel.org	Public technical project reference
+reserved domains	iana.org	Internet namespace reference
+html specification	w3.org	Web standard reference

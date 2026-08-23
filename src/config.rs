@@ -149,6 +149,13 @@ pub struct WebCrawlConfig {
     /// unlimited (falls back to the overall `max_pages` budget only).
     #[serde(default = "default_max_pages_per_domain")]
     pub max_pages_per_domain: usize,
+    /// Whether to fetch and expand XML sitemaps declared in `robots.txt`
+    /// (or a conventional `/sitemap.xml`) for each newly seeded origin.
+    /// Keep this enabled for durable crawlers that have an explicit sitemap
+    /// budget; bounded bootstrap runs can disable it to avoid a large
+    /// third-party sitemap index consuming the run before page fetching.
+    #[serde(default = "default_true")]
+    pub discover_sitemaps: bool,
     /// Whether to discover RSS/Atom feeds (via `<link rel="alternate">`
     /// tags and well-known paths like `/feed`) and crawl their items at
     /// elevated priority, similar to sitemap discovery.
@@ -178,6 +185,7 @@ impl Default for WebCrawlConfig {
             allowed_domains: Vec::new(),
             max_page_size_bytes: 10 * 1024 * 1024,
             max_pages_per_domain: default_max_pages_per_domain(),
+            discover_sitemaps: true,
             discover_feeds: true,
         }
     }
@@ -703,5 +711,15 @@ mod tests {
 
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omitted_sitemap_discovery_setting_defaults_to_enabled_for_existing_configs() {
+        let serialized = toml::to_string(&Config::default()).unwrap();
+        let prior_config = serialized.replace("discover_sitemaps = true\n", "");
+
+        let loaded: Config = toml::from_str(&prior_config).unwrap();
+
+        assert!(loaded.web_crawl.discover_sitemaps);
     }
 }

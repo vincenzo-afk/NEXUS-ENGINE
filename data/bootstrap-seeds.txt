@@ -1,0 +1,19 @@
+# Curated public technical bootstrap seeds for NEXUS.
+#
+# These are not an assertion of permission to crawl beyond each site's own
+# robots.txt policy. The bootstrap harness always leaves robots checks enabled,
+# identifies itself as NexusBot, applies per-domain delays, and keeps the crawl
+# budget intentionally bounded.
+#
+# Keep sources authoritative, public, and topically diverse. One seed per
+# registrable domain limits the first pass to a small, polite request burst.
+
+https://doc.rust-lang.org/book/
+https://docs.rs/serde/latest/serde/
+https://developer.mozilla.org/en-US/docs/Web/HTTP
+https://www.rfc-editor.org/rfc/rfc9309.html
+https://en.wikipedia.org/wiki/Search_engine
+https://www.rust-lang.org/learn
+https://www.w3.org/TR/REC-html40/
+https://www.iana.org/domains/reserved
+https://www.kernel.org/

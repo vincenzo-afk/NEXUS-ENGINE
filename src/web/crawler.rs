@@ -592,19 +592,21 @@ impl WebCrawler {
             queue.set_domain_delay(&canonical::domain_of(url), (delay * 1000.0) as u64);
         }
 
-        let sitemap_urls: Vec<String> = if robots.sitemaps.is_empty() {
-            vec![format!("{}/sitemap.xml", canonical::origin_of(url))]
-        } else {
-            robots.sitemaps.clone()
-        };
+        if self.config.discover_sitemaps {
+            let sitemap_urls: Vec<String> = if robots.sitemaps.is_empty() {
+                vec![format!("{}/sitemap.xml", canonical::origin_of(url))]
+            } else {
+                robots.sitemaps.clone()
+            };
 
-        debug!(
-            "seed domain '{}': {} sitemap URL(s) to process",
-            canonical::domain_of(url),
-            sitemap_urls.len()
-        );
-        for sitemap_url in &sitemap_urls {
-            self.enqueue_sitemap(sitemap_url, queue, report, 0);
+            debug!(
+                "seed domain '{}': {} sitemap URL(s) to process",
+                canonical::domain_of(url),
+                sitemap_urls.len()
+            );
+            for sitemap_url in &sitemap_urls {
+                self.enqueue_sitemap(sitemap_url, queue, report, 0);
+            }
         }
 
         if self.config.discover_feeds {
